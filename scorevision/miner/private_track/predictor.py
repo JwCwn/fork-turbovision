@@ -1,6 +1,7 @@
 import math
 import os
 from dataclasses import dataclass
+from logging import getLogger
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,8 @@ import torch
 from ultralytics import YOLO
 
 from scorevision.utils.schemas import FramePrediction
+
+logger = getLogger(__name__)
 
 PLAYER_MODEL_NAME = "football-player-detection.pt"
 BALL_MODEL_NAME = "football-ball-detection.pt"
@@ -103,6 +106,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get_device() -> str:
     global _DEVICE
     if _DEVICE is None:
@@ -130,7 +140,16 @@ def _load_models() -> tuple[YOLO, YOLO | None]:
         raise FileNotFoundError(f"Missing player model: {player_path}")
 
     player_model = YOLO(player_path)
-    ball_model = YOLO(ball_path) if ball_path.exists() else None
+    use_ball_model = _env_bool("PRIVATE_TRACK_USE_BALL_MODEL", True)
+    ball_model = YOLO(ball_path) if use_ball_model and ball_path.exists() else None
+    if use_ball_model and ball_model is None:
+        logger.warning("Ball model not found at %s; using player model ball class", ball_path)
+    logger.info(
+        "Loaded YOLO models from %s on %s (dedicated_ball_model=%s)",
+        models_dir,
+        _get_device(),
+        ball_model is not None,
+    )
     _MODELS = (player_model, ball_model)
     return _MODELS
 
@@ -448,6 +467,47 @@ def _infer_actions(
     return sorted(deduped.values(), key=lambda item: item.frame)
 
 
+def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePrediction]:
+    if not predictions:
+        return []
+
+    per_action_defaults = {
+        "pass": 12,
+        "pass_received": 12,
+        "shot": 3,
+    }
+    kept: list[FramePrediction] = []
+
+    for action, default_limit in per_action_defaults.items():
+        limit = max(
+            0,
+            _env_int(
+                f"PRIVATE_TRACK_MAX_{action.upper()}",
+                default_limit,
+            ),
+        )
+        action_predictions = [pred for pred in predictions if pred.action == action]
+        action_predictions.sort(key=lambda pred: pred.confidence, reverse=True)
+        kept.extend(action_predictions[:limit])
+
+    other_predictions = [
+        pred for pred in predictions if pred.action not in per_action_defaults
+    ]
+    kept.extend(other_predictions)
+
+    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 25))
+    kept.sort(key=lambda pred: pred.confidence, reverse=True)
+    kept = kept[:max_total]
+    return sorted(kept, key=lambda pred: pred.frame)
+
+
+def _count_by_action(predictions: list[FramePrediction]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for prediction in predictions:
+        counts[prediction.action] = counts.get(prediction.action, 0) + 1
+    return counts
+
+
 def predict_actions(video_path: Path) -> list[FramePrediction]:
     detections = _run_detector(video_path)
     if not detections:
@@ -455,4 +515,17 @@ def predict_actions(video_path: Path) -> list[FramePrediction]:
 
     possession_points, free_ball_points = _build_possession_points(detections)
     possession_segments = _merge_possessions(possession_points)
-    return _infer_actions(possession_segments, free_ball_points)
+    raw_predictions = _infer_actions(possession_segments, free_ball_points)
+    predictions = _limit_predictions(raw_predictions)
+
+    logger.info(
+        "Prediction summary: sampled_frames=%d possession_points=%d "
+        "segments=%d raw_predictions=%d kept_predictions=%d actions=%s",
+        len(detections),
+        len(possession_points),
+        len(possession_segments),
+        len(raw_predictions),
+        len(predictions),
+        _count_by_action(predictions),
+    )
+    return predictions
