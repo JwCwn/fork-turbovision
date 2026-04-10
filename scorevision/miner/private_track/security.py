@@ -1,40 +1,30 @@
+import hashlib
 import os
 from fastapi import Depends, Header, HTTPException, Request
-from fiber import constants as cst
-from fiber import utils
-from fiber.chain import signatures
-from fiber.miner.security.nonce_management import NonceManager
+from substrateinterface import Keypair
 
 BLACKLIST_ENABLED = os.environ.get("BLACKLIST_ENABLED", "true").lower() in ("true", "1", "yes")
 VERIFY_ENABLED = os.environ.get("VERIFY_ENABLED", "true").lower() in ("true", "1", "yes")
 
-_nonce_manager = NonceManager()
-
 
 async def verify_request(
     request: Request,
-    validator_hotkey: str = Header(..., alias=cst.VALIDATOR_HOTKEY),
-    signature: str = Header(..., alias=cst.SIGNATURE),
-    miner_hotkey: str = Header(..., alias=cst.MINER_HOTKEY),
-    nonce: str = Header(..., alias=cst.NONCE),
+    validator_hotkey: str = Header(..., alias="Validator-Hotkey"),
+    signature: str = Header(..., alias="Signature"),
+    nonce: str = Header(..., alias="Nonce"),
 ):
-    if not _nonce_manager.nonce_is_valid(nonce):
-        raise HTTPException(status_code=401, detail="Invalid nonce")
-
     body = await request.body()
-    payload_hash = signatures.get_hash(body)
-    message = utils.construct_header_signing_message(
-        nonce=nonce,
-        miner_hotkey=miner_hotkey,
-        payload_hash=payload_hash,
-    )
+    payload_hash = hashlib.blake2b(body, digest_size=32).hexdigest()
+    message = f"{nonce}{payload_hash}"
 
-    if not signatures.verify_signature(
-        message=message,
-        signer_ss58_address=validator_hotkey,
-        signature=signature,
-    ):
-        raise HTTPException(status_code=401, detail="Invalid signature")
+    try:
+        keypair = Keypair(ss58_address=validator_hotkey)
+        if not keypair.verify(message.encode("utf-8"), signature):
+            raise HTTPException(status_code=401, detail="Invalid signature")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Signature verification failed: {e}")
 
 
 def get_security_dependencies() -> list:
