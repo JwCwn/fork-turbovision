@@ -84,9 +84,13 @@ def run_container(
     env_file: Path | None = None,
     env_vars: dict[str, str] | None = None,
     volumes: list[str] | None = None,
+    gpus: str | None = "all",
 ) -> tuple[str | None, str | None]:
     logger.info("Running container: %s on port %d", image.full_name, port)
     cmd = ["docker", "run", "-p", f"{port}:{port}"]
+
+    if gpus:
+        cmd.extend(["--gpus", gpus])
 
     if env_file and env_file.exists():
         cmd.extend(["--env-file", str(env_file)])

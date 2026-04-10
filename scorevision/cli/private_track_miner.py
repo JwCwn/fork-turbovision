@@ -183,6 +183,10 @@ def start_miner_container(image: DockerImage) -> None:
     env_vars = {k: v for k, v in env_vars.items() if v}
     volumes = [f"{settings.BITTENSOR_WALLET_PATH}:/root/.bittensor/wallets:ro"]
 
+    models_dir = os.environ.get("MINER_MODELS_DIR") or str(project_root / "models")
+    if Path(models_dir).exists():
+        volumes.append(f"{models_dir}:/app/models:ro")
+
     console.info(f"Starting container on port {port}")
     container_id, error = run_container(
         image,
