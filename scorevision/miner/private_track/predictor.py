@@ -65,6 +65,7 @@ class FrameDetections:
     height: int
     players: list[Detection]
     balls: list[Detection]
+    goalkeepers: list[Detection]
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,9 @@ def _run_detection_batch(
             for det in player_dets
             if det.cls_id in (PLAYER_MODEL_PLAYER_CLASS, PLAYER_MODEL_GOALKEEPER_CLASS)
         ]
+        goalkeeper_dets = [
+            det for det in player_dets if det.cls_id == PLAYER_MODEL_GOALKEEPER_CLASS
+        ]
         fallback_balls = [
             det for det in player_dets if det.cls_id == PLAYER_MODEL_BALL_CLASS
         ]
@@ -282,6 +286,7 @@ def _run_detection_batch(
                 height=int(image.shape[0]),
                 players=player_candidates,
                 balls=dedicated_balls or fallback_balls,
+                goalkeepers=goalkeeper_dets,
             )
         )
 
@@ -434,14 +439,18 @@ def _merge_possessions(points: list[PossessionPoint]) -> list[PossessionSegment]
 def _infer_actions(
     possessions: list[PossessionSegment],
     free_ball_samples: list[FreeBallSample],
+    frame_detections: list[FrameDetections],
 ) -> list[FramePrediction]:
     predictions: list[FramePrediction] = []
     min_owner_change = _env_float("PRIVATE_TRACK_PASS_OWNER_CHANGE", 130.0)
     max_transition_gap = max(1, _env_int("PRIVATE_TRACK_PASS_MAX_GAP", 40))
     shot_speed_threshold = _env_float("PRIVATE_TRACK_SHOT_SPEED_THRESHOLD", 16.0)
-    goal_speed_threshold = _env_float("PRIVATE_TRACK_GOAL_SPEED_THRESHOLD", 22.0)
-    goal_edge_ratio = _env_float("PRIVATE_TRACK_GOAL_EDGE_RATIO", 0.12)
-    goal_min_window = max(1, _env_int("PRIVATE_TRACK_GOAL_MIN_WINDOW", 8))
+    goal_speed_threshold = _env_float("PRIVATE_TRACK_GOAL_SPEED_THRESHOLD", 16.0)
+    goal_edge_ratio = _env_float("PRIVATE_TRACK_GOAL_EDGE_RATIO", 0.18)
+    goal_min_window = max(1, _env_int("PRIVATE_TRACK_GOAL_MIN_WINDOW", 4))
+    save_window_back = max(1, _env_int("PRIVATE_TRACK_SAVE_WINDOW_BACK", 5))
+    save_window_fwd = max(1, _env_int("PRIVATE_TRACK_SAVE_WINDOW_FWD", 30))
+    save_distance_max = _env_float("PRIVATE_TRACK_SAVE_DISTANCE_MAX", 120.0)
 
     # PASS / PASS_RECEIVED detection
     for previous, current in zip(possessions, possessions[1:]):
@@ -487,6 +496,39 @@ def _infer_actions(
         predictions.append(
             FramePrediction(frame=shot_frame, action="shot", confidence=0.52)
         )
+
+    # SAVE detection — paired with shot, goalkeeper near ball after shot
+    detections_by_frame: dict[int, FrameDetections] = {
+        fd.frame: fd for fd in frame_detections
+    }
+    save_frames_emitted: set[int] = set()
+    for shot_frame in shot_frames:
+        candidate_frames = sorted(
+            f for f in detections_by_frame
+            if shot_frame - save_window_back <= f <= shot_frame + save_window_fwd
+        )
+        for f in candidate_frames:
+            fd = detections_by_frame[f]
+            if not fd.goalkeepers:
+                continue
+            ball = _select_ball(fd)
+            if ball is None:
+                continue
+            for keeper in fd.goalkeepers:
+                dist = _distance(keeper.cx, keeper.cy, ball.cx, ball.cy)
+                if dist <= save_distance_max:
+                    if f not in save_frames_emitted:
+                        predictions.append(
+                            FramePrediction(
+                                frame=int(f),
+                                action="save",
+                                confidence=0.55,
+                            )
+                        )
+                        save_frames_emitted.add(f)
+                    break
+            if f in save_frames_emitted:
+                break
 
     # GOAL detection — heuristic:
     # After a fast shot, ball reaches the left/right edge zone (potential goal area)
@@ -565,6 +607,7 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
         "pass": 8,
         "pass_received": 6,
         "shot": 2,
+        "save": 2,
         "goal": 1,
     }
     kept: list[FramePrediction] = []
@@ -616,7 +659,7 @@ def predict_actions(video_path: Path) -> list[FramePrediction]:
 
     possession_points, free_ball_samples = _build_possession_points(detections)
     possession_segments = _merge_possessions(possession_points)
-    raw_predictions = _infer_actions(possession_segments, free_ball_samples)
+    raw_predictions = _infer_actions(possession_segments, free_ball_samples, detections)
     predictions = _limit_predictions(raw_predictions)
 
     if source_fps > 0 and abs(source_fps - VALIDATOR_FRAME_RATE) >= 0.01:
