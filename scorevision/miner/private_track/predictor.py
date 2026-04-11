@@ -77,6 +77,16 @@ class PossessionPoint:
 
 
 @dataclass(frozen=True)
+class FreeBallSample:
+    frame: int
+    speed: float
+    ball_x: float
+    ball_y: float
+    frame_width: int
+    frame_height: int
+
+
+@dataclass(frozen=True)
 class PossessionSegment:
     start_frame: int
     end_frame: int
@@ -321,9 +331,9 @@ def _find_owner(frame_data: FrameDetections, ball: Detection) -> Detection | Non
 
 def _build_possession_points(
     detections: list[FrameDetections],
-) -> tuple[list[PossessionPoint], list[tuple[int, float]]]:
+) -> tuple[list[PossessionPoint], list[FreeBallSample]]:
     possession_points: list[PossessionPoint] = []
-    free_ball_points: list[tuple[int, float]] = []
+    free_ball_samples: list[FreeBallSample] = []
     previous_ball: Detection | None = None
     previous_frame: int | None = None
 
@@ -353,12 +363,21 @@ def _build_possession_points(
                 previous_ball.cx,
                 previous_ball.cy,
             ) / frame_delta
-            free_ball_points.append((frame_data.frame, ball_speed))
+            free_ball_samples.append(
+                FreeBallSample(
+                    frame=frame_data.frame,
+                    speed=ball_speed,
+                    ball_x=ball.cx,
+                    ball_y=ball.cy,
+                    frame_width=frame_data.width,
+                    frame_height=frame_data.height,
+                )
+            )
 
         previous_ball = ball
         previous_frame = frame_data.frame
 
-    return possession_points, free_ball_points
+    return possession_points, free_ball_samples
 
 
 def _merge_possessions(points: list[PossessionPoint]) -> list[PossessionSegment]:
@@ -414,13 +433,17 @@ def _merge_possessions(points: list[PossessionPoint]) -> list[PossessionSegment]
 
 def _infer_actions(
     possessions: list[PossessionSegment],
-    free_ball_points: list[tuple[int, float]],
+    free_ball_samples: list[FreeBallSample],
 ) -> list[FramePrediction]:
     predictions: list[FramePrediction] = []
     min_owner_change = _env_float("PRIVATE_TRACK_PASS_OWNER_CHANGE", 130.0)
     max_transition_gap = max(1, _env_int("PRIVATE_TRACK_PASS_MAX_GAP", 40))
     shot_speed_threshold = _env_float("PRIVATE_TRACK_SHOT_SPEED_THRESHOLD", 16.0)
+    goal_speed_threshold = _env_float("PRIVATE_TRACK_GOAL_SPEED_THRESHOLD", 22.0)
+    goal_edge_ratio = _env_float("PRIVATE_TRACK_GOAL_EDGE_RATIO", 0.12)
+    goal_min_window = max(1, _env_int("PRIVATE_TRACK_GOAL_MIN_WINDOW", 8))
 
+    # PASS / PASS_RECEIVED detection
     for previous, current in zip(possessions, possessions[1:]):
         owner_change = _distance(
             previous.owner_x,
@@ -446,19 +469,72 @@ def _infer_actions(
             )
         )
 
+    # SHOT detection
+    shot_frames: list[int] = []
     for segment in possessions:
-        candidate_speeds = [
-            speed
-            for frame, speed in free_ball_points
-            if segment.end_frame < frame <= segment.end_frame + max_transition_gap
+        candidate = [
+            sample
+            for sample in free_ball_samples
+            if segment.end_frame < sample.frame <= segment.end_frame + max_transition_gap
         ]
-        if not candidate_speeds:
+        if not candidate:
             continue
-        if max(candidate_speeds) < shot_speed_threshold:
+        max_speed = max(sample.speed for sample in candidate)
+        if max_speed < shot_speed_threshold:
             continue
+        shot_frame = int(segment.end_frame)
+        shot_frames.append(shot_frame)
         predictions.append(
-            FramePrediction(frame=int(segment.end_frame), action="shot", confidence=0.52)
+            FramePrediction(frame=shot_frame, action="shot", confidence=0.52)
         )
+
+    # GOAL detection — heuristic:
+    # After a fast shot, ball reaches the left/right edge zone (potential goal area)
+    # AND ball disappears or stays there for a while (no follow-up possession nearby)
+    if shot_frames and free_ball_samples:
+        for shot_frame in shot_frames:
+            # Look ahead window: samples within 60 frames after the shot
+            window = [
+                sample
+                for sample in free_ball_samples
+                if shot_frame < sample.frame <= shot_frame + 60
+            ]
+            if len(window) < goal_min_window:
+                continue
+
+            # Check if ball reached an edge zone with high speed
+            edge_reached = False
+            edge_frame: int | None = None
+            for sample in window:
+                if sample.frame_width <= 0:
+                    continue
+                left_edge = sample.frame_width * goal_edge_ratio
+                right_edge = sample.frame_width * (1.0 - goal_edge_ratio)
+                if (sample.ball_x <= left_edge or sample.ball_x >= right_edge) \
+                        and sample.speed >= goal_speed_threshold * 0.6:
+                    edge_reached = True
+                    edge_frame = sample.frame
+                    break
+
+            if not edge_reached or edge_frame is None:
+                continue
+
+            # Check if any possession resumed within ~30 frames after edge_reached
+            # If a player took possession soon, it's likely NOT a goal (just a clearance/save)
+            resumed_quickly = any(
+                edge_frame < segment.start_frame <= edge_frame + 30
+                for segment in possessions
+            )
+            if resumed_quickly:
+                continue
+
+            predictions.append(
+                FramePrediction(
+                    frame=int(edge_frame),
+                    action="goal",
+                    confidence=0.45,
+                )
+            )
 
     deduped: dict[tuple[str, int], FramePrediction] = {}
     suppress_gap = max(1, _env_int("PRIVATE_TRACK_ACTION_SUPPRESS_GAP", 25))
@@ -488,7 +564,8 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     per_action_defaults = {
         "pass": 8,
         "pass_received": 6,
-        "shot": 1,
+        "shot": 2,
+        "goal": 1,
     }
     kept: list[FramePrediction] = []
 
@@ -537,9 +614,9 @@ def predict_actions(video_path: Path) -> list[FramePrediction]:
     if not detections:
         return []
 
-    possession_points, free_ball_points = _build_possession_points(detections)
+    possession_points, free_ball_samples = _build_possession_points(detections)
     possession_segments = _merge_possessions(possession_points)
-    raw_predictions = _infer_actions(possession_segments, free_ball_points)
+    raw_predictions = _infer_actions(possession_segments, free_ball_samples)
     predictions = _limit_predictions(raw_predictions)
 
     if source_fps > 0 and abs(source_fps - VALIDATOR_FRAME_RATE) >= 0.01:
