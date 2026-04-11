@@ -158,13 +158,27 @@ def _distance(x1: float, y1: float, x2: float, y2: float) -> float:
     return math.hypot(x1 - x2, y1 - y2)
 
 
-def _read_sampled_frames(video_path: Path) -> list[tuple[int, Any]]:
+def _read_sampled_frames(video_path: Path) -> tuple[list[tuple[int, Any]], float, int]:
     stride = max(1, _env_int("PRIVATE_TRACK_SAMPLE_STRIDE", 5))
     max_frames = max(1, _env_int("PRIVATE_TRACK_MAX_SAMPLED_FRAMES", 180))
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    duration = total_frames / fps if fps > 0 else 0.0
+    logger.info(
+        "Video metadata: fps=%.3f total_frames=%d duration=%.2fs resolution=%dx%d",
+        fps,
+        total_frames,
+        duration,
+        width,
+        height,
+    )
 
     sampled_frames: list[tuple[int, Any]] = []
     frame_idx = 0
@@ -180,7 +194,7 @@ def _read_sampled_frames(video_path: Path) -> list[tuple[int, Any]]:
     finally:
         cap.release()
 
-    return sampled_frames
+    return sampled_frames, fps, total_frames
 
 
 def _parse_detections(result, frame_number: int) -> list[Detection]:
@@ -264,17 +278,17 @@ def _run_detection_batch(
     return parsed
 
 
-def _run_detector(video_path: Path) -> list[FrameDetections]:
-    sampled_frames = _read_sampled_frames(video_path)
+def _run_detector(video_path: Path) -> tuple[list[FrameDetections], float, int]:
+    sampled_frames, fps, total_frames = _read_sampled_frames(video_path)
     if not sampled_frames:
-        return []
+        return [], fps, total_frames
 
     batch_size = max(1, _env_int("PRIVATE_TRACK_BATCH_SIZE", 12))
     frame_detections: list[FrameDetections] = []
     for start in range(0, len(sampled_frames), batch_size):
         batch = sampled_frames[start : start + batch_size]
         frame_detections.extend(_run_detection_batch(batch))
-    return frame_detections
+    return frame_detections, fps, total_frames
 
 
 def _select_ball(frame_data: FrameDetections) -> Detection | None:
@@ -508,8 +522,18 @@ def _count_by_action(predictions: list[FramePrediction]) -> dict[str, int]:
     return counts
 
 
+VALIDATOR_FRAME_RATE = 25.0
+
+
+def _rescale_frame_to_validator(frame: int, source_fps: float) -> int:
+    if source_fps <= 0 or abs(source_fps - VALIDATOR_FRAME_RATE) < 0.01:
+        return int(frame)
+    seconds = frame / source_fps
+    return int(round(seconds * VALIDATOR_FRAME_RATE))
+
+
 def predict_actions(video_path: Path) -> list[FramePrediction]:
-    detections = _run_detector(video_path)
+    detections, source_fps, total_frames = _run_detector(video_path)
     if not detections:
         return []
 
@@ -518,9 +542,28 @@ def predict_actions(video_path: Path) -> list[FramePrediction]:
     raw_predictions = _infer_actions(possession_segments, free_ball_points)
     predictions = _limit_predictions(raw_predictions)
 
+    if source_fps > 0 and abs(source_fps - VALIDATOR_FRAME_RATE) >= 0.01:
+        rescaled = [
+            FramePrediction(
+                frame=_rescale_frame_to_validator(p.frame, source_fps),
+                action=p.action,
+                confidence=p.confidence,
+            )
+            for p in predictions
+        ]
+        logger.info(
+            "Rescaled %d predictions from source_fps=%.3f to validator_fps=%.1f",
+            len(predictions),
+            source_fps,
+            VALIDATOR_FRAME_RATE,
+        )
+        predictions = rescaled
+
     logger.info(
-        "Prediction summary: sampled_frames=%d possession_points=%d "
-        "segments=%d raw_predictions=%d kept_predictions=%d actions=%s",
+        "Prediction summary: source_fps=%.3f total_frames=%d sampled_frames=%d "
+        "possession_points=%d segments=%d raw_predictions=%d kept_predictions=%d actions=%s",
+        source_fps,
+        total_frames,
         len(detections),
         len(possession_points),
         len(possession_segments),
