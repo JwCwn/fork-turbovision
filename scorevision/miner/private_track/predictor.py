@@ -351,8 +351,8 @@ def _merge_possessions(points: list[PossessionPoint]) -> list[PossessionSegment]
     if not points:
         return []
 
-    owner_merge_distance = _env_float("PRIVATE_TRACK_OWNER_MERGE_DISTANCE", 45.0)
-    max_gap = max(1, _env_int("PRIVATE_TRACK_SEGMENT_MAX_GAP", 20))
+    owner_merge_distance = _env_float("PRIVATE_TRACK_OWNER_MERGE_DISTANCE", 70.0)
+    max_gap = max(1, _env_int("PRIVATE_TRACK_SEGMENT_MAX_GAP", 30))
 
     segments: list[PossessionSegment] = []
     current = PossessionSegment(
@@ -403,7 +403,7 @@ def _infer_actions(
     free_ball_points: list[tuple[int, float]],
 ) -> list[FramePrediction]:
     predictions: list[FramePrediction] = []
-    min_owner_change = _env_float("PRIVATE_TRACK_PASS_OWNER_CHANGE", 80.0)
+    min_owner_change = _env_float("PRIVATE_TRACK_PASS_OWNER_CHANGE", 130.0)
     max_transition_gap = max(1, _env_int("PRIVATE_TRACK_PASS_MAX_GAP", 40))
     shot_speed_threshold = _env_float("PRIVATE_TRACK_SHOT_SPEED_THRESHOLD", 16.0)
 
@@ -447,7 +447,7 @@ def _infer_actions(
         )
 
     deduped: dict[tuple[str, int], FramePrediction] = {}
-    suppress_gap = max(1, _env_int("PRIVATE_TRACK_ACTION_SUPPRESS_GAP", 12))
+    suppress_gap = max(1, _env_int("PRIVATE_TRACK_ACTION_SUPPRESS_GAP", 25))
     for prediction in sorted(predictions, key=lambda item: (item.action, item.frame)):
         key = (prediction.action, prediction.frame)
         existing = next(
@@ -472,9 +472,9 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
         return []
 
     per_action_defaults = {
-        "pass": 12,
-        "pass_received": 12,
-        "shot": 3,
+        "pass": 8,
+        "pass_received": 6,
+        "shot": 1,
     }
     kept: list[FramePrediction] = []
 
@@ -495,7 +495,7 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     ]
     kept.extend(other_predictions)
 
-    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 25))
+    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 15))
     kept.sort(key=lambda pred: pred.confidence, reverse=True)
     kept = kept[:max_total]
     return sorted(kept, key=lambda pred: pred.frame)
