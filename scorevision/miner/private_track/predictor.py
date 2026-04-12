@@ -452,7 +452,9 @@ def _infer_actions(
     save_window_fwd = max(1, _env_int("PRIVATE_TRACK_SAVE_WINDOW_FWD", 30))
     save_distance_max = _env_float("PRIVATE_TRACK_SAVE_DISTANCE_MAX", 120.0)
 
-    # PASS / PASS_RECEIVED detection
+    # PASS / PASS_RECEIVED detection — confidence scaled by how clean the transition is
+    strong_pass_owner_change = _env_float("PRIVATE_TRACK_STRONG_PASS_OWNER_CHANGE", 220.0)
+    strong_pass_max_gap = max(1, _env_int("PRIVATE_TRACK_STRONG_PASS_MAX_GAP", 20))
     for previous, current in zip(possessions, possessions[1:]):
         owner_change = _distance(
             previous.owner_x,
@@ -465,21 +467,29 @@ def _infer_actions(
         if owner_change < min_owner_change or frame_gap > max_transition_gap:
             continue
 
+        is_strong = (
+            owner_change >= strong_pass_owner_change
+            and frame_gap <= strong_pass_max_gap
+        )
+        pass_conf = 0.70 if is_strong else 0.45
+        recv_conf = 0.72 if is_strong else 0.48
+
         pass_frame = max(previous.start_frame, previous.end_frame)
         receive_frame = current.start_frame
         predictions.append(
-            FramePrediction(frame=int(pass_frame), action="pass", confidence=0.55)
+            FramePrediction(frame=int(pass_frame), action="pass", confidence=pass_conf)
         )
         predictions.append(
             FramePrediction(
                 frame=int(receive_frame),
                 action="pass_received",
-                confidence=0.60,
+                confidence=recv_conf,
             )
         )
 
-    # SHOT detection
+    # SHOT detection — confidence scaled by ball speed
     shot_frames: list[int] = []
+    strong_shot_speed = _env_float("PRIVATE_TRACK_STRONG_SHOT_SPEED", 28.0)
     for segment in possessions:
         candidate = [
             sample
@@ -491,10 +501,11 @@ def _infer_actions(
         max_speed = max(sample.speed for sample in candidate)
         if max_speed < shot_speed_threshold:
             continue
+        shot_conf = 0.72 if max_speed >= strong_shot_speed else 0.58
         shot_frame = int(segment.end_frame)
         shot_frames.append(shot_frame)
         predictions.append(
-            FramePrediction(frame=shot_frame, action="shot", confidence=0.52)
+            FramePrediction(frame=shot_frame, action="shot", confidence=shot_conf)
         )
 
     # SAVE detection — paired with shot, goalkeeper near ball after shot
@@ -522,7 +533,7 @@ def _infer_actions(
                             FramePrediction(
                                 frame=int(f),
                                 action="save",
-                                confidence=0.55,
+                                confidence=0.68,
                             )
                         )
                         save_frames_emitted.add(f)
@@ -574,7 +585,7 @@ def _infer_actions(
                 FramePrediction(
                     frame=int(edge_frame),
                     action="goal",
-                    confidence=0.45,
+                    confidence=0.62,
                 )
             )
 
@@ -600,14 +611,27 @@ def _infer_actions(
 
 
 def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePrediction]:
+    """
+    High-precision mode: keep only the highest-confidence predictions per action,
+    and cap the total number aggressively to avoid false-positive penalties.
+
+    Scoring math requires precision > 55% for any positive score. With more
+    predictions, each wrong one subtracts weight directly from the matched pool.
+    Prefer missing an action to emitting an uncertain one.
+    """
+    if not predictions:
+        return []
+
+    min_confidence = _env_float("PRIVATE_TRACK_MIN_CONFIDENCE", 0.55)
+    predictions = [p for p in predictions if p.confidence >= min_confidence]
     if not predictions:
         return []
 
     per_action_defaults = {
-        "pass": 8,
-        "pass_received": 6,
-        "shot": 2,
-        "save": 2,
+        "pass": 2,
+        "pass_received": 2,
+        "shot": 1,
+        "save": 1,
         "goal": 1,
     }
     kept: list[FramePrediction] = []
@@ -629,7 +653,7 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     ]
     kept.extend(other_predictions)
 
-    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 15))
+    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 5))
     kept.sort(key=lambda pred: pred.confidence, reverse=True)
     kept = kept[:max_total]
     return sorted(kept, key=lambda pred: pred.frame)
