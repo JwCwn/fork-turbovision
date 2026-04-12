@@ -618,12 +618,21 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     Scoring math requires precision > 55% for any positive score. With more
     predictions, each wrong one subtracts weight directly from the matched pool.
     Prefer missing an action to emitting an uncertain one.
+
+    Note: ML predictions (from E2E-Spot) are already filtered by SPOT_MIN_CONFIDENCE.
+    Heuristic predictions are filtered by PRIVATE_TRACK_MIN_CONFIDENCE.
+    ML-covered actions (goal, foul, clearance, ball_out_of_play, substitution) are
+    exempt from the heuristic threshold since they come from the trained model.
     """
     if not predictions:
         return []
 
-    min_confidence = _env_float("PRIVATE_TRACK_MIN_CONFIDENCE", 0.55)
-    predictions = [p for p in predictions if p.confidence >= min_confidence]
+    min_confidence = _env_float("PRIVATE_TRACK_MIN_CONFIDENCE", 0.40)
+    ml_only_actions = {"goal", "foul", "clearance", "ball_out_of_play", "substitution"}
+    predictions = [
+        p for p in predictions
+        if p.action in ml_only_actions or p.confidence >= min_confidence
+    ]
     if not predictions:
         return []
 

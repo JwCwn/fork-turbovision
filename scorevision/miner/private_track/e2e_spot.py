@@ -118,20 +118,21 @@ SOCCERNET_V2_CLASSES = [
     "Yellow->red card",    # 17
 ]
 
-# Maps SoccerNet class index → (TurboVision action, confidence bonus)
-SOCCERNET_TO_TURBOVISION: dict[int, tuple[str, float]] = {
-    1:  ("shot", 0.75),            # Penalty → shot
-    2:  ("pass", 0.60),            # Kick-off → pass
-    3:  ("goal", 0.80),            # Goal → goal
-    4:  ("substitution", 0.70),    # Substitution → substitution
-    6:  ("shot", 0.70),            # Shots on target → shot
-    7:  ("shot", 0.65),            # Shots off target → shot
-    8:  ("clearance", 0.70),       # Clearance → clearance
-    9:  ("ball_out_of_play", 0.65),# Ball out of play
-    10: ("ball_out_of_play", 0.60),# Throw-in → ball_out_of_play
-    11: ("foul", 0.75),            # Foul → foul
-    12: ("foul", 0.70),            # Indirect free-kick → foul
-    13: ("foul", 0.72),            # Direct free-kick → foul
+# Maps SoccerNet class index → TurboVision action.
+# Confidence is the raw model probability (no multiplier).
+SOCCERNET_TO_TURBOVISION: dict[int, str] = {
+    1:  "shot",              # Penalty → shot
+    2:  "pass",              # Kick-off → pass
+    3:  "goal",              # Goal → goal
+    4:  "substitution",      # Substitution → substitution
+    6:  "shot",              # Shots on target → shot
+    7:  "shot",              # Shots off target → shot
+    8:  "clearance",         # Clearance → clearance
+    9:  "ball_out_of_play",  # Ball out of play
+    10: "ball_out_of_play",  # Throw-in → ball_out_of_play
+    11: "foul",              # Foul → foul
+    12: "foul",              # Indirect free-kick → foul
+    13: "foul",              # Direct free-kick → foul
 }
 
 
@@ -230,7 +231,7 @@ def _env_float(name: str, default: float) -> float:
 def predict_with_spot(video_path: Path) -> list[SpotPrediction]:
     """Run E2E-Spot on a video and return mapped TurboVision predictions."""
 
-    min_confidence = _env_float("SPOT_MIN_CONFIDENCE", 0.25)
+    min_confidence = _env_float("SPOT_MIN_CONFIDENCE", 0.30)
     sample_fps = _env_float("SPOT_SAMPLE_FPS", 2.0)
 
     try:
@@ -292,22 +293,21 @@ def predict_with_spot(video_path: Path) -> list[SpotPrediction]:
             all_probs.append(probs[0].cpu().numpy())
     all_probs = np.concatenate(all_probs, axis=0)
 
-    # Extract predictions via mapping
+    # Extract predictions via mapping — use raw model probability as confidence
     predictions: list[SpotPrediction] = []
     for frame_idx in range(all_probs.shape[0]):
-        for sn_cls, (tv_action, conf_bonus) in SOCCERNET_TO_TURBOVISION.items():
+        for sn_cls, tv_action in SOCCERNET_TO_TURBOVISION.items():
             if sn_cls >= all_probs.shape[1]:
                 continue
             prob = float(all_probs[frame_idx, sn_cls])
-            combined_conf = prob * conf_bonus
-            if combined_conf < min_confidence:
+            if prob < min_confidence:
                 continue
 
             frame_25fps = frame_indices_25fps[frame_idx] if frame_idx < len(frame_indices_25fps) else 0
             predictions.append(SpotPrediction(
                 frame_25fps=frame_25fps,
                 action=tv_action,
-                confidence=combined_conf,
+                confidence=prob,
             ))
 
     # Deduplicate: keep highest confidence per action within suppress window
