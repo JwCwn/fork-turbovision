@@ -630,9 +630,13 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     per_action_defaults = {
         "pass": 2,
         "pass_received": 2,
-        "shot": 1,
+        "shot": 2,
         "save": 1,
         "goal": 1,
+        "foul": 2,
+        "clearance": 1,
+        "ball_out_of_play": 2,
+        "substitution": 1,
     }
     kept: list[FramePrediction] = []
 
@@ -653,7 +657,7 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     ]
     kept.extend(other_predictions)
 
-    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 5))
+    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 8))
     kept.sort(key=lambda pred: pred.confidence, reverse=True)
     kept = kept[:max_total]
     return sorted(kept, key=lambda pred: pred.frame)
@@ -676,42 +680,90 @@ def _rescale_frame_to_validator(frame: int, source_fps: float) -> int:
     return int(round(seconds * VALIDATOR_FRAME_RATE))
 
 
-def predict_actions(video_path: Path) -> list[FramePrediction]:
-    detections, source_fps, total_frames = _run_detector(video_path)
-    if not detections:
-        return []
+def _merge_spot_and_heuristic(
+    spot_preds: list[FramePrediction],
+    heuristic_preds: list[FramePrediction],
+) -> list[FramePrediction]:
+    """Merge E2E-Spot ML predictions with YOLO heuristic predictions.
 
-    possession_points, free_ball_samples = _build_possession_points(detections)
-    possession_segments = _merge_possessions(possession_points)
-    raw_predictions = _infer_actions(possession_segments, free_ball_samples, detections)
-    predictions = _limit_predictions(raw_predictions)
+    Strategy:
+    - ML predictions take priority (higher precision on rare events)
+    - Heuristic predictions fill gaps (pass/pass_received/save)
+    - Deduplicate within 25-frame window per action
+    """
+    combined: list[FramePrediction] = []
+    suppress_gap = 25  # 1 second at 25fps
 
-    if source_fps > 0 and abs(source_fps - VALIDATOR_FRAME_RATE) >= 0.01:
-        rescaled = [
-            FramePrediction(
-                frame=_rescale_frame_to_validator(p.frame, source_fps),
-                action=p.action,
-                confidence=p.confidence,
-            )
-            for p in predictions
-        ]
-        logger.info(
-            "Rescaled %d predictions from source_fps=%.3f to validator_fps=%.1f",
-            len(predictions),
-            source_fps,
-            VALIDATOR_FRAME_RATE,
+    # Add all ML predictions first (priority)
+    for pred in spot_preds:
+        combined.append(pred)
+
+    # Add heuristic predictions only if no ML prediction nearby for same action
+    for pred in heuristic_preds:
+        is_dup = any(
+            c.action == pred.action and abs(c.frame - pred.frame) <= suppress_gap
+            for c in combined
         )
-        predictions = rescaled
+        if not is_dup:
+            combined.append(pred)
+
+    return sorted(combined, key=lambda p: p.frame)
+
+
+def predict_actions(video_path: Path) -> list[FramePrediction]:
+    # --- E2E-Spot ML predictions (rare high-value events) ---
+    spot_predictions: list[FramePrediction] = []
+    use_spot = _env_bool("PRIVATE_TRACK_USE_SPOT", True)
+    if use_spot:
+        try:
+            from scorevision.miner.private_track.e2e_spot import predict_with_spot
+            spot_results = predict_with_spot(video_path)
+            spot_predictions = [
+                FramePrediction(
+                    frame=sp.frame_25fps,
+                    action=sp.action,
+                    confidence=sp.confidence,
+                )
+                for sp in spot_results
+            ]
+        except Exception as e:
+            logger.warning("E2E-Spot failed, falling back to heuristics only: %s", e)
+
+    # --- YOLO heuristic predictions (pass/pass_received/save) ---
+    detections, source_fps, total_frames = _run_detector(video_path)
+
+    heuristic_predictions: list[FramePrediction] = []
+    if detections:
+        possession_points, free_ball_samples = _build_possession_points(detections)
+        possession_segments = _merge_possessions(possession_points)
+        raw_heuristic = _infer_actions(possession_segments, free_ball_samples, detections)
+
+        if source_fps > 0 and abs(source_fps - VALIDATOR_FRAME_RATE) >= 0.01:
+            raw_heuristic = [
+                FramePrediction(
+                    frame=_rescale_frame_to_validator(p.frame, source_fps),
+                    action=p.action,
+                    confidence=p.confidence,
+                )
+                for p in raw_heuristic
+            ]
+
+        heuristic_predictions = raw_heuristic
+
+    # --- Merge ML + heuristic ---
+    merged = _merge_spot_and_heuristic(spot_predictions, heuristic_predictions)
+
+    # --- Apply global precision filter ---
+    predictions = _limit_predictions(merged)
 
     logger.info(
-        "Prediction summary: source_fps=%.3f total_frames=%d sampled_frames=%d "
-        "possession_points=%d segments=%d raw_predictions=%d kept_predictions=%d actions=%s",
-        source_fps,
-        total_frames,
-        len(detections),
-        len(possession_points),
-        len(possession_segments),
-        len(raw_predictions),
+        "Prediction summary: source_fps=%.3f total_frames=%d "
+        "spot_preds=%d heuristic_preds=%d merged=%d kept=%d actions=%s",
+        source_fps if detections else 0,
+        total_frames if detections else 0,
+        len(spot_predictions),
+        len(heuristic_predictions),
+        len(merged),
         len(predictions),
         _count_by_action(predictions),
     )

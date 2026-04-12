@@ -11,12 +11,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python deps — pin timm==0.6.13 for E2E-Spot GSM compatibility
 RUN pip install --no-cache-dir \
     fastapi uvicorn httpx pydantic opencv-python-headless cryptography \
-    ultralytics supervision numpy \
+    ultralytics supervision numpy "timm==0.6.13" \
     "fiber @ git+https://github.com/rayonlabs/fiber.git@a41ab890708757140a3cf4aae8e5af57a8b03159"
 
-# Models are mounted at runtime from host: /app/models -> see private_track_miner.py
+# Clone E2E-Spot repo (needed for model.shift GSM import)
+RUN git clone --depth 1 https://github.com/jhong93/spot.git /app/spot
+
+# Models (YOLO + E2E-Spot checkpoint) are mounted at runtime from host
 RUN mkdir -p /app/models
 
 COPY scorevision/miner/private_track/ ./scorevision/miner/private_track/
