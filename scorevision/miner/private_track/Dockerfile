@@ -11,17 +11,26 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps — pin timm==0.6.13 for E2E-Spot GSM compatibility
+# Python deps — pin timm==0.6.13 for GSM backbone compatibility, scipy for peak detection
 RUN pip install --no-cache-dir \
     fastapi uvicorn httpx pydantic opencv-python-headless cryptography \
-    ultralytics supervision numpy "timm==0.6.13" \
+    ultralytics supervision numpy "timm==0.6.13" scipy einops \
     "fiber @ git+https://github.com/rayonlabs/fiber.git@a41ab890708757140a3cf4aae8e5af57a8b03159"
 
-# Clone E2E-Spot repo (needed for model.shift GSM import)
+# E2E-Spot repo (kept for legacy; disabled by default)
 RUN git clone --depth 1 https://github.com/jhong93/spot.git /app/spot
 
-# Models (YOLO + E2E-Spot checkpoint) are mounted at runtime from host
-RUN mkdir -p /app/models
+# lRomul ball-action-spotting model source (MultiDimStacker)
+RUN git clone --depth 1 https://github.com/lRomul/ball-action-spotting.git /tmp/lromul && \
+    mkdir -p /app/lromul_src && \
+    cp -r /tmp/lromul/src/models /app/lromul_src/ && \
+    rm -rf /tmp/lromul
+
+# Models are mounted at runtime from host:
+#   /app/models/              (YOLO *.pt files)
+#   /app/models/lromul/       (lRomul .pth checkpoint)
+#   /app/models/e2e-spot/     (optional E2E-Spot checkpoint)
+RUN mkdir -p /app/models /app/models/lromul /app/models/e2e-spot
 
 COPY scorevision/miner/private_track/ ./scorevision/miner/private_track/
 COPY scorevision/utils/logging.py scorevision/utils/schemas.py ./scorevision/utils/

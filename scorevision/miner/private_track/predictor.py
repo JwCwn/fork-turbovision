@@ -653,8 +653,9 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
         return []
 
     per_action_defaults = {
-        "pass": 1,
-        "pass_received": 1,
+        "pass": 3,
+        "pass_received": 3,
+        "take_on": 2,
         "shot": 1,
         "save": 1,
         "goal": 1,
@@ -678,7 +679,7 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     ]
     kept.extend(other_predictions)
 
-    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 3))
+    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 8))
     kept.sort(key=lambda pred: pred.confidence, reverse=True)
     kept = kept[:max_total]
     return sorted(kept, key=lambda pred: pred.frame)
@@ -732,9 +733,28 @@ def _merge_spot_and_heuristic(
 
 
 def predict_actions(video_path: Path) -> list[FramePrediction]:
-    # --- E2E-Spot ML predictions (rare high-value events) ---
-    # Disabled by default — SoccerNet-v2 vocabulary doesn't match TurboVision frequent
-    # actions, and rare-event false positives cause large penalties on regular-play clips.
+    # --- lRomul SoccerNet Ball Action Spotting 2023 (1st place, 86.47% mAP@1) ---
+    # Detects PASS (→ pass + pass_received) and DRIVE (→ take_on).
+    # Output passes through Gaussian smoothing + peak detection (matches lRomul's
+    # challenge pipeline) before mapping to TurboVision predictions.
+    ml_predictions: list[FramePrediction] = []
+    use_lromul = _env_bool("PRIVATE_TRACK_USE_LROMUL", True)
+    if use_lromul:
+        try:
+            from scorevision.miner.private_track.lromul_ball import predict_with_lromul
+            lromul_results = predict_with_lromul(video_path)
+            ml_predictions = [
+                FramePrediction(
+                    frame=lp.frame_25fps,
+                    action=lp.action,
+                    confidence=lp.confidence,
+                )
+                for lp in lromul_results
+            ]
+        except Exception as e:
+            logger.warning("lRomul failed, falling back to heuristics only: %s", e)
+
+    # --- Legacy E2E-Spot (disabled by default) ---
     spot_predictions: list[FramePrediction] = []
     use_spot = _env_bool("PRIVATE_TRACK_USE_SPOT", False)
     if use_spot:
@@ -750,7 +770,11 @@ def predict_actions(video_path: Path) -> list[FramePrediction]:
                 for sp in spot_results
             ]
         except Exception as e:
-            logger.warning("E2E-Spot failed, falling back to heuristics only: %s", e)
+            logger.warning("E2E-Spot failed: %s", e)
+
+    # Combine ML sources: lRomul preferred for pass/pass_received/take_on
+    ml_predictions.extend(spot_predictions)
+    spot_predictions = ml_predictions
 
     # --- YOLO heuristic predictions (pass/pass_received/save) ---
     detections, source_fps, total_frames = _run_detector(video_path)
