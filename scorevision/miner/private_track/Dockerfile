@@ -11,10 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps — pin timm==0.6.13 for GSM backbone compatibility, scipy for peak detection
+# Python deps — timm==0.9.2 matches lRomul; scipy for peak detection.
+# (E2E-Spot needs older timm but it's disabled by default so we prioritize lRomul.)
 RUN pip install --no-cache-dir \
     fastapi uvicorn httpx pydantic opencv-python-headless cryptography \
-    ultralytics supervision numpy "timm==0.6.13" scipy einops \
+    ultralytics supervision numpy "timm==0.9.2" scipy einops \
     "fiber @ git+https://github.com/rayonlabs/fiber.git@a41ab890708757140a3cf4aae8e5af57a8b03159"
 
 # E2E-Spot repo (kept for legacy; disabled by default)
