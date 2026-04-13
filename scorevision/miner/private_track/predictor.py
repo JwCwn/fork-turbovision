@@ -452,9 +452,16 @@ def _infer_actions(
     save_window_fwd = max(1, _env_int("PRIVATE_TRACK_SAVE_WINDOW_FWD", 30))
     save_distance_max = _env_float("PRIVATE_TRACK_SAVE_DISTANCE_MAX", 120.0)
 
-    # PASS / PASS_RECEIVED detection — confidence scaled by how clean the transition is
+    # PASS / PASS_RECEIVED detection — ULTRA-conservative: only strong transitions.
+    # Pass weight is only 1.0 with 1.0s tolerance (min_score=0.0), so timing precision
+    # is critical. False positives hurt nearly as much as matches help.
     strong_pass_owner_change = _env_float("PRIVATE_TRACK_STRONG_PASS_OWNER_CHANGE", 220.0)
     strong_pass_max_gap = max(1, _env_int("PRIVATE_TRACK_STRONG_PASS_MAX_GAP", 20))
+    sample_stride = max(1, _env_int("PRIVATE_TRACK_SAMPLE_STRIDE", 5))
+
+    # Index free-ball samples by frame for peak-speed lookup within the gap
+    free_samples_by_frame = {s.frame: s for s in free_ball_samples}
+
     for previous, current in zip(possessions, possessions[1:]):
         owner_change = _distance(
             previous.owner_x,
@@ -464,30 +471,41 @@ def _infer_actions(
         )
         frame_gap = current.start_frame - previous.end_frame
 
-        if owner_change < min_owner_change or frame_gap > max_transition_gap:
+        # Strict gate: only strong, unambiguous passes
+        if owner_change < strong_pass_owner_change:
+            continue
+        if frame_gap > strong_pass_max_gap:
             continue
 
-        is_strong = (
-            owner_change >= strong_pass_owner_change
-            and frame_gap <= strong_pass_max_gap
-        )
-        pass_conf = 0.70 if is_strong else 0.45
-        recv_conf = 0.72 if is_strong else 0.48
+        # Timing correction — real pass is AFTER prev.end_frame (ball hasn't left yet
+        # when we last observed A holding). Find the ball-speed peak in the gap; that's
+        # closest to the kick moment. Fallback: small forward offset from prev.end_frame.
+        gap_samples = [
+            s for s in free_ball_samples
+            if previous.end_frame < s.frame < current.start_frame
+        ]
+        if gap_samples:
+            peak = max(gap_samples, key=lambda s: s.speed)
+            pass_frame = int(peak.frame)
+        else:
+            # No free-ball observation in the gap — bias slightly forward
+            pass_frame = int(previous.end_frame + min(sample_stride, frame_gap // 2))
 
-        pass_frame = max(previous.start_frame, previous.end_frame)
-        receive_frame = current.start_frame
+        # pass_received is when B first has ball; sampled observation may be a bit late.
+        # Bias slightly backward within the stride uncertainty.
+        receive_frame = int(max(
+            pass_frame + 1,
+            current.start_frame - sample_stride // 2,
+        ))
+
         predictions.append(
-            FramePrediction(frame=int(pass_frame), action="pass", confidence=pass_conf)
+            FramePrediction(frame=pass_frame, action="pass", confidence=0.75)
         )
         predictions.append(
-            FramePrediction(
-                frame=int(receive_frame),
-                action="pass_received",
-                confidence=recv_conf,
-            )
+            FramePrediction(frame=receive_frame, action="pass_received", confidence=0.77)
         )
 
-    # SHOT detection — confidence scaled by ball speed
+    # SHOT detection — only strong shots (high ball speed)
     shot_frames: list[int] = []
     strong_shot_speed = _env_float("PRIVATE_TRACK_STRONG_SHOT_SPEED", 28.0)
     for segment in possessions:
@@ -499,13 +517,13 @@ def _infer_actions(
         if not candidate:
             continue
         max_speed = max(sample.speed for sample in candidate)
-        if max_speed < shot_speed_threshold:
+        # Require strong shot speed only — weak "maybe-shots" are costly (weight 4.7)
+        if max_speed < strong_shot_speed:
             continue
-        shot_conf = 0.72 if max_speed >= strong_shot_speed else 0.58
         shot_frame = int(segment.end_frame)
         shot_frames.append(shot_frame)
         predictions.append(
-            FramePrediction(frame=shot_frame, action="shot", confidence=shot_conf)
+            FramePrediction(frame=shot_frame, action="shot", confidence=0.70)
         )
 
     # SAVE detection — paired with shot, goalkeeper near ball after shot
@@ -612,40 +630,34 @@ def _infer_actions(
 
 def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePrediction]:
     """
-    High-precision mode: keep only the highest-confidence predictions per action,
-    and cap the total number aggressively to avoid false-positive penalties.
+    Ultra-conservative mode: ML disabled, YOLO heuristics produce very few,
+    high-confidence predictions only.
 
-    Scoring math requires precision > 55% for any positive score. With more
-    predictions, each wrong one subtracts weight directly from the matched pool.
-    Prefer missing an action to emitting an uncertain one.
+    Scoring math: score = max(0, (matched - unmatched) / gt_total).
+    Each false positive subtracts full action weight. Better to emit NOTHING
+    than uncertain predictions.
 
-    Note: ML predictions (from E2E-Spot) are already filtered by SPOT_MIN_CONFIDENCE.
-    Heuristic predictions are filtered by PRIVATE_TRACK_MIN_CONFIDENCE.
-    ML-covered actions (goal, foul, clearance, ball_out_of_play, substitution) are
-    exempt from the heuristic threshold since they come from the trained model.
+    Strategy:
+    - Only strong pass (owner_change >= 220px, gap <= 20 frames)
+    - Only strong shot (ball speed >= 28)
+    - Save only with clear goalkeeper signal
+    - Goal only with strict edge + speed + no-resumption criteria
+    - Max 3 predictions total per challenge
     """
     if not predictions:
         return []
 
-    min_confidence = _env_float("PRIVATE_TRACK_MIN_CONFIDENCE", 0.40)
-    ml_only_actions = {"goal", "foul", "clearance", "ball_out_of_play", "substitution"}
-    predictions = [
-        p for p in predictions
-        if p.action in ml_only_actions or p.confidence >= min_confidence
-    ]
+    min_confidence = _env_float("PRIVATE_TRACK_MIN_CONFIDENCE", 0.60)
+    predictions = [p for p in predictions if p.confidence >= min_confidence]
     if not predictions:
         return []
 
     per_action_defaults = {
-        "pass": 2,
-        "pass_received": 2,
-        "shot": 2,
+        "pass": 1,
+        "pass_received": 1,
+        "shot": 1,
         "save": 1,
         "goal": 1,
-        "foul": 2,
-        "clearance": 1,
-        "ball_out_of_play": 2,
-        "substitution": 1,
     }
     kept: list[FramePrediction] = []
 
@@ -666,7 +678,7 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     ]
     kept.extend(other_predictions)
 
-    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 8))
+    max_total = max(0, _env_int("PRIVATE_TRACK_MAX_PREDICTIONS", 3))
     kept.sort(key=lambda pred: pred.confidence, reverse=True)
     kept = kept[:max_total]
     return sorted(kept, key=lambda pred: pred.frame)
@@ -721,8 +733,10 @@ def _merge_spot_and_heuristic(
 
 def predict_actions(video_path: Path) -> list[FramePrediction]:
     # --- E2E-Spot ML predictions (rare high-value events) ---
+    # Disabled by default — SoccerNet-v2 vocabulary doesn't match TurboVision frequent
+    # actions, and rare-event false positives cause large penalties on regular-play clips.
     spot_predictions: list[FramePrediction] = []
-    use_spot = _env_bool("PRIVATE_TRACK_USE_SPOT", True)
+    use_spot = _env_bool("PRIVATE_TRACK_USE_SPOT", False)
     if use_spot:
         try:
             from scorevision.miner.private_track.e2e_spot import predict_with_spot

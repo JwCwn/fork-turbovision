@@ -228,11 +228,27 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def predict_with_spot(video_path: Path) -> list[SpotPrediction]:
-    """Run E2E-Spot on a video and return mapped TurboVision predictions."""
+ACTION_MIN_PROB = {
+    "goal": 0.80,
+    "foul": 0.75,
+    "substitution": 0.70,
+    "shot": 0.65,
+    "clearance": 0.60,
+    "ball_out_of_play": 0.55,
+    "pass": 0.50,
+}
 
-    min_confidence = _env_float("SPOT_MIN_CONFIDENCE", 0.30)
+
+def predict_with_spot(video_path: Path) -> list[SpotPrediction]:
+    """Run E2E-Spot on a video and return mapped TurboVision predictions.
+
+    Uses per-action confidence thresholds weighted by the penalty cost.
+    High-weight actions (goal=10.9, foul=7.7) require very high probability
+    since false positives subtract the full weight from the matched score.
+    """
+
     sample_fps = _env_float("SPOT_SAMPLE_FPS", 2.0)
+    max_ml_per_clip = int(_env_float("SPOT_MAX_PER_CLIP", 2.0))
 
     try:
         model, config = _load_spot_model()
@@ -293,14 +309,15 @@ def predict_with_spot(video_path: Path) -> list[SpotPrediction]:
             all_probs.append(probs[0].cpu().numpy())
     all_probs = np.concatenate(all_probs, axis=0)
 
-    # Extract predictions via mapping — use raw model probability as confidence
+    # Extract predictions via mapping with per-action probability thresholds
     predictions: list[SpotPrediction] = []
     for frame_idx in range(all_probs.shape[0]):
         for sn_cls, tv_action in SOCCERNET_TO_TURBOVISION.items():
             if sn_cls >= all_probs.shape[1]:
                 continue
             prob = float(all_probs[frame_idx, sn_cls])
-            if prob < min_confidence:
+            min_prob = ACTION_MIN_PROB.get(tv_action, 0.60)
+            if prob < min_prob:
                 continue
 
             frame_25fps = frame_indices_25fps[frame_idx] if frame_idx < len(frame_indices_25fps) else 0
@@ -322,12 +339,22 @@ def predict_with_spot(video_path: Path) -> list[SpotPrediction]:
         if not is_dup:
             deduped.append(pred)
 
-    deduped.sort(key=lambda p: p.frame_25fps)
+    # Cap total ML predictions per clip to limit false-positive damage.
+    # Per action, keep at most 1 (highest confidence). Overall cap via max_ml_per_clip.
+    per_action_best: dict[str, SpotPrediction] = {}
+    for pred in sorted(deduped, key=lambda p: p.confidence, reverse=True):
+        if pred.action not in per_action_best:
+            per_action_best[pred.action] = pred
+
+    capped = sorted(per_action_best.values(), key=lambda p: p.confidence, reverse=True)[:max_ml_per_clip]
+    capped.sort(key=lambda p: p.frame_25fps)
+
     logger.info(
-        "E2E-Spot: %d frames processed, %d raw predictions, %d after dedup (actions: %s)",
+        "E2E-Spot: %d frames processed, %d raw predictions, %d after dedup, %d after cap (actions: %s)",
         all_probs.shape[0],
         len(predictions),
         len(deduped),
-        {p.action: sum(1 for d in deduped if d.action == p.action) for p in deduped},
+        len(capped),
+        {p.action: sum(1 for d in capped if d.action == p.action) for p in capped},
     )
-    return deduped
+    return capped
