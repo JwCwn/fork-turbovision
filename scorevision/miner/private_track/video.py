@@ -33,6 +33,10 @@ def _collection_filename(url: str) -> str:
     return f"chunk-{abs(hash(url))}.mp4"
 
 
+def _collect_videos_enabled() -> bool:
+    return os.environ.get("PT_COLLECT_VIDEOS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 async def download_video(url: str) -> Path:
     logger.info(f"Downloading video: {url}")
     async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
@@ -43,16 +47,19 @@ async def download_video(url: str) -> Path:
         temp_file.write(response.content)
         temp_file.close()
 
-        # Optional: save a persistent copy for training data collection.
-        collect = _collect_dir()
-        if collect is not None:
-            dest = collect / _collection_filename(url)
-            try:
-                if not dest.exists():
-                    shutil.copy(temp_file.name, str(dest))
-                    logger.info(f"Collected training video: {dest}")
-            except Exception as e:
-                logger.warning(f"Failed to collect video to {dest}: {e}")
+        # Optional: also save the video file (disabled by default, enable via
+        # PT_COLLECT_VIDEOS=true). URLs are always recorded in challenges.jsonl
+        # by routes.py so we can bulk-download later if desired.
+        if _collect_videos_enabled():
+            collect = _collect_dir()
+            if collect is not None:
+                dest = collect / _collection_filename(url)
+                try:
+                    if not dest.exists():
+                        shutil.copy(temp_file.name, str(dest))
+                        logger.info(f"Collected training video: {dest}")
+                except Exception as e:
+                    logger.warning(f"Failed to collect video to {dest}: {e}")
 
         return Path(temp_file.name)
 
