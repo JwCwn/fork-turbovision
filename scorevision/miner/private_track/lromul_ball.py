@@ -216,13 +216,15 @@ def predict_with_lromul(video_path: Path) -> list[LromulPrediction]:
     """Run lRomul on a video, apply Gaussian smoothing + peak detection,
     map PASS/DRIVE peaks to TurboVision predictions.
     """
-    # Thresholds — tunable via env
-    pass_peak_height = _env_float("LROMUL_PASS_PEAK_HEIGHT", 0.30)
-    drive_peak_height = _env_float("LROMUL_DRIVE_PEAK_HEIGHT", 0.35)
+    # Thresholds — applied to GAUSSIAN-SMOOTHED signal (sigma=3), so lower than raw.
+    # Raw peaks of 0.4-0.6 get diluted to ~0.10-0.20 after smoothing.
+    pass_peak_height = _env_float("LROMUL_PASS_PEAK_HEIGHT", 0.12)
+    drive_peak_height = _env_float("LROMUL_DRIVE_PEAK_HEIGHT", 0.12)
     peak_distance = _env_int("LROMUL_PEAK_DISTANCE", 15)
     max_per_clip = _env_int("LROMUL_MAX_PER_CLIP", 6)
     stride = _env_int("LROMUL_STRIDE", 15)  # window stride in frames
     pass_receive_offset = _env_int("LROMUL_PASS_RECEIVE_OFFSET", 12)
+    smooth_sigma = _env_float("LROMUL_SMOOTH_SIGMA", 3.0)
 
     try:
         model = _load_model()
@@ -283,14 +285,30 @@ def predict_with_lromul(video_path: Path) -> list[LromulPrediction]:
             return int(src_frame)
         return int(round(src_frame * VALIDATOR_FRAME_RATE / fps))
 
+    # Log raw peaks before smoothing — useful for threshold tuning
+    raw_pass = probs_arr[:, 0]
+    raw_drive = probs_arr[:, 1]
+    logger.info(
+        "lRomul raw peaks: PASS max=%.3f (frame %d), DRIVE max=%.3f (frame %d)",
+        float(raw_pass.max()), int(centers_arr[raw_pass.argmax()]),
+        float(raw_drive.max()), int(centers_arr[raw_drive.argmax()]),
+    )
+
+    def _rescale_conf(smoothed_peak: float, threshold: float) -> float:
+        """Map smoothed peak [threshold, threshold+0.4] → confidence [0.65, 0.95]."""
+        span = 0.40
+        norm = min(1.0, max(0.0, (smoothed_peak - threshold) / span))
+        return 0.65 + norm * 0.30
+
     # PASS detection
-    pass_signal = gaussian_filter1d(probs_arr[:, 0], sigma=3.0)
+    pass_signal = gaussian_filter1d(raw_pass, sigma=smooth_sigma)
     pass_peaks, pass_props = find_peaks(
         pass_signal, height=pass_peak_height, distance=peak_distance,
     )
     for i, idx in enumerate(pass_peaks):
         center_src = int(centers_arr[idx])
-        conf = float(pass_props["peak_heights"][i])
+        smoothed = float(pass_props["peak_heights"][i])
+        conf = _rescale_conf(smoothed, pass_peak_height)
         v_frame = to_validator_frame(center_src)
         predictions.append(LromulPrediction(
             frame_25fps=v_frame,
@@ -304,13 +322,14 @@ def predict_with_lromul(video_path: Path) -> list[LromulPrediction]:
         ))
 
     # DRIVE detection (maps to take_on)
-    drive_signal = gaussian_filter1d(probs_arr[:, 1], sigma=3.0)
+    drive_signal = gaussian_filter1d(raw_drive, sigma=smooth_sigma)
     drive_peaks, drive_props = find_peaks(
         drive_signal, height=drive_peak_height, distance=peak_distance,
     )
     for i, idx in enumerate(drive_peaks):
         center_src = int(centers_arr[idx])
-        conf = float(drive_props["peak_heights"][i])
+        smoothed = float(drive_props["peak_heights"][i])
+        conf = _rescale_conf(smoothed, drive_peak_height)
         predictions.append(LromulPrediction(
             frame_25fps=to_validator_frame(center_src),
             action="take_on",

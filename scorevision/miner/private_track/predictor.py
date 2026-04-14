@@ -452,58 +452,41 @@ def _infer_actions(
     save_window_fwd = max(1, _env_int("PRIVATE_TRACK_SAVE_WINDOW_FWD", 30))
     save_distance_max = _env_float("PRIVATE_TRACK_SAVE_DISTANCE_MAX", 120.0)
 
-    # PASS / PASS_RECEIVED detection — ULTRA-conservative: only strong transitions.
-    # Pass weight is only 1.0 with 1.0s tolerance (min_score=0.0), so timing precision
-    # is critical. False positives hurt nearly as much as matches help.
-    strong_pass_owner_change = _env_float("PRIVATE_TRACK_STRONG_PASS_OWNER_CHANGE", 220.0)
-    strong_pass_max_gap = max(1, _env_int("PRIVATE_TRACK_STRONG_PASS_MAX_GAP", 20))
-    sample_stride = max(1, _env_int("PRIVATE_TRACK_SAMPLE_STRIDE", 5))
+    # PASS / PASS_RECEIVED detection — disabled here; lRomul ML handles these.
+    # YOLO heuristic pass detection was too imprecise (130-220px owner-change
+    # threshold missed short passes and over-triggered on ambiguous transitions).
+    # Keeping the code path gated by env var in case we want to re-enable.
+    if _env_bool("PRIVATE_TRACK_USE_HEURISTIC_PASS", False):
+        strong_pass_owner_change = _env_float("PRIVATE_TRACK_STRONG_PASS_OWNER_CHANGE", 220.0)
+        strong_pass_max_gap = max(1, _env_int("PRIVATE_TRACK_STRONG_PASS_MAX_GAP", 20))
+        sample_stride = max(1, _env_int("PRIVATE_TRACK_SAMPLE_STRIDE", 5))
 
-    # Index free-ball samples by frame for peak-speed lookup within the gap
-    free_samples_by_frame = {s.frame: s for s in free_ball_samples}
-
-    for previous, current in zip(possessions, possessions[1:]):
-        owner_change = _distance(
-            previous.owner_x,
-            previous.owner_y,
-            current.owner_x,
-            current.owner_y,
-        )
-        frame_gap = current.start_frame - previous.end_frame
-
-        # Strict gate: only strong, unambiguous passes
-        if owner_change < strong_pass_owner_change:
-            continue
-        if frame_gap > strong_pass_max_gap:
-            continue
-
-        # Timing correction — real pass is AFTER prev.end_frame (ball hasn't left yet
-        # when we last observed A holding). Find the ball-speed peak in the gap; that's
-        # closest to the kick moment. Fallback: small forward offset from prev.end_frame.
-        gap_samples = [
-            s for s in free_ball_samples
-            if previous.end_frame < s.frame < current.start_frame
-        ]
-        if gap_samples:
-            peak = max(gap_samples, key=lambda s: s.speed)
-            pass_frame = int(peak.frame)
-        else:
-            # No free-ball observation in the gap — bias slightly forward
-            pass_frame = int(previous.end_frame + min(sample_stride, frame_gap // 2))
-
-        # pass_received is when B first has ball; sampled observation may be a bit late.
-        # Bias slightly backward within the stride uncertainty.
-        receive_frame = int(max(
-            pass_frame + 1,
-            current.start_frame - sample_stride // 2,
-        ))
-
-        predictions.append(
-            FramePrediction(frame=pass_frame, action="pass", confidence=0.75)
-        )
-        predictions.append(
-            FramePrediction(frame=receive_frame, action="pass_received", confidence=0.77)
-        )
+        for previous, current in zip(possessions, possessions[1:]):
+            owner_change = _distance(
+                previous.owner_x, previous.owner_y,
+                current.owner_x, current.owner_y,
+            )
+            frame_gap = current.start_frame - previous.end_frame
+            if owner_change < strong_pass_owner_change or frame_gap > strong_pass_max_gap:
+                continue
+            gap_samples = [
+                s for s in free_ball_samples
+                if previous.end_frame < s.frame < current.start_frame
+            ]
+            if gap_samples:
+                pass_frame = int(max(gap_samples, key=lambda s: s.speed).frame)
+            else:
+                pass_frame = int(previous.end_frame + min(sample_stride, frame_gap // 2))
+            receive_frame = int(max(
+                pass_frame + 1,
+                current.start_frame - sample_stride // 2,
+            ))
+            predictions.append(FramePrediction(
+                frame=pass_frame, action="pass", confidence=0.75,
+            ))
+            predictions.append(FramePrediction(
+                frame=receive_frame, action="pass_received", confidence=0.77,
+            ))
 
     # SHOT detection — only strong shots (high ball speed)
     shot_frames: list[int] = []
@@ -647,8 +630,17 @@ def _limit_predictions(predictions: list[FramePrediction]) -> list[FramePredicti
     if not predictions:
         return []
 
+    # ML-sourced actions are already validated by peak detection in their own module;
+    # they don't need to clear the heuristic min_confidence gate.
     min_confidence = _env_float("PRIVATE_TRACK_MIN_CONFIDENCE", 0.60)
-    predictions = [p for p in predictions if p.confidence >= min_confidence]
+    ml_actions = {
+        "pass", "pass_received", "take_on",
+        "goal", "foul", "clearance", "ball_out_of_play", "substitution",
+    }
+    predictions = [
+        p for p in predictions
+        if p.action in ml_actions or p.confidence >= min_confidence
+    ]
     if not predictions:
         return []
 
