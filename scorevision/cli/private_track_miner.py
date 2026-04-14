@@ -187,6 +187,19 @@ def start_miner_container(image: DockerImage) -> None:
     if Path(models_dir).exists():
         volumes.append(f"{models_dir}:/app/models:ro")
 
+    # Optional: persistent training-data collection.
+    # Host: set PT_COLLECT_HOST_DIR to any writable path to enable.
+    # Container mounts it at /app/collected and PT_COLLECT_DIR points there.
+    collect_host = os.environ.get("PT_COLLECT_HOST_DIR") or str(project_root / "collected")
+    if os.environ.get("PT_COLLECT_HOST_DIR") or Path(collect_host).exists():
+        try:
+            Path(collect_host).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        volumes.append(f"{collect_host}:/app/collected")
+        env_vars["PT_COLLECT_DIR"] = "/app/collected"
+        console.info(f"Training-data collection enabled → {collect_host}")
+
     console.info(f"Starting container on port {port}")
     container_id, error = run_container(
         image,
