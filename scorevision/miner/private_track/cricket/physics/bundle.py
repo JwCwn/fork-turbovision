@@ -54,6 +54,16 @@ def project(Pw, C, rvec, f, cx, cy):
     return np.array([f * Xc[0] / Xc[2] + cx, f * Xc[1] / Xc[2] + cy])
 
 
+def project_R(Pw, C, R, f, cx, cy):
+    """project() with a precomputed rotation matrix R. rvec is constant within
+    a frame, so callers compute R once per frame instead of re-running
+    cv2.Rodrigues per point. Bit-identical to project()."""
+    Xc = R @ (np.asarray(Pw, float) - np.asarray(C, float))
+    if Xc[2] <= 1e-6:
+        return np.array([1e6, 1e6])
+    return np.array([f * Xc[0] / Xc[2] + cx, f * Xc[1] / Xc[2] + cy])
+
+
 def traj_point(P0, V0, tb, V1, t):
     g = np.array([0, 0, -G])
     if t <= tb:
@@ -85,21 +95,22 @@ def residuals(p, obs, cx, cy, fps, w=(1.0, 1.0, 2.0, 0.05), kph_obs=None):
     V0 = _v0(prm, kph_obs)
     res = []
     ws, wp, wb, wr = w
+    C, f = prm["C"], prm["f"]
     for fr, o in obs.items():
         t = fr / fps
-        rvec = _rvec_at(prm, t)
+        R = _R(_rvec_at(prm, t))  # one Rodrigues per frame, reused for all points
         for name, uv in o.get("stumps", {}).items():
             if name in STUMP_3D:
-                res += list(ws * (project(STUMP_3D[name], prm["C"], rvec, prm["f"], cx, cy) - uv))
+                res += list(ws * (project_R(STUMP_3D[name], C, R, f, cx, cy) - uv))
         pe = o.get("pitch", {})
         if pe:
             P3 = pitch_3d(prm["W"])
             for k, uv in pe.items():
                 if k in P3:
-                    res += list(wp * (project(P3[k], prm["C"], rvec, prm["f"], cx, cy) - uv))
+                    res += list(wp * (project_R(P3[k], C, R, f, cx, cy) - uv))
         if "ball" in o:
             P = traj_point(prm["P0"], V0, prm["tb"], prm["V1"], t)
-            res += list(wb * (project(P, prm["C"], rvec, prm["f"], cx, cy) - o["ball"]))
+            res += list(wb * (project_R(P, C, R, f, cx, cy) - o["ball"]))
     res += list(wr * prm["w"]); res += list(wr * prm["a"])
     res.append(wr * (prm["W"] - 1.5))
     # physical anchors: the ball is on the ground at the bounce (z=0); plausible

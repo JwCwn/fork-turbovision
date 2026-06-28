@@ -13,14 +13,17 @@ so the package is self-contained inside the Docker image.
 from __future__ import annotations
 
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import cv2
 import torch
 
+from scorevision.miner.private_track.logging import logger
 from scorevision.miner.private_track.cricket.tracknet.model import TrackNetV2
-from scorevision.miner.private_track.cricket.tracknet.infer import infer_task
+from scorevision.miner.private_track.cricket.tracknet.infer import infer_task, infer_cache, frame_to_cache
 from scorevision.miner.private_track.cricket.physics import bundle as B
 from scorevision.miner.private_track.cricket.physics.run_delivery import init_params
 from scorevision.miner.private_track.cricket.physics import pipeline as PL
@@ -58,8 +61,11 @@ class CricketMiner:
             return None, {}
         h0, w0 = cv2.imread(str(frames[0])).shape[:2]
         cx, cy = w0 / 2.0, h0 / 2.0
+        tg0 = time.perf_counter()
         ball, _, _ = infer_task(self.mb, task, self.device, self.nfb, thresh=0.8)
+        tg1 = time.perf_counter()
         kps, _, _ = PL.detect_keypoints(self.mk, task, self.device)
+        tg2 = time.perf_counter()
         ballw = PL.delivery_window(PL.clean_ball(ball))
         kpc = PL.clean_kps(kps)
         if not ballw:
@@ -71,6 +77,11 @@ class CricketMiner:
         if nb < 4 or ns < 3:
             return None, dict(reason=f"insufficient det ball={nb} stumps={ns}")
         sol = B.fit(obs, cx, cy, fps, init_params(cx, cy, kph), kph_obs=kph)
+        tg3 = time.perf_counter()
+        logger.info(
+            "[timing] geom.ball=%.2fs geom.kp=%.2fs geom.fit=%.2fs (window_frames=%d)",
+            tg1 - tg0, tg2 - tg1, tg3 - tg2, len(frames),
+        )
         prm = B.unpack(sol.x)
         r = B.residuals(sol.x, obs, cx, cy, fps, kph_obs=kph)
         rms = float(np.sqrt(np.mean(r ** 2)))
@@ -125,10 +136,29 @@ class CricketMiner:
     # ---- full prediction from a raw video -----------------------------------
     def predict_video(self, video_path, fps=25.0):
         video_path = Path(video_path)
-        meta = self.ocr_meta(video_path)
-        task, seg = self._extract_delivery(video_path, fps)
+        t0 = time.perf_counter()
+        # OCR is independent of the perception/physics path, so run it on a
+        # worker thread: its ~7s overlaps the extract pass instead of adding to
+        # the critical path. geometry() needs meta["kph"], so we join the OCR
+        # result before the physics solve (which runs after extract anyway).
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            ocr_future = ex.submit(self.ocr_meta, video_path)
+            task, seg = self._extract_delivery(video_path, fps)
+            t_extract = time.perf_counter()
+            meta = ocr_future.result()
+            t_ocr = time.perf_counter()
         geom, dbg = self.geometry(task, meta.get("kph"), fps)
+        t_geom = time.perf_counter()
+        logger.info(
+            "[timing] extract=%.2fs ocr_wait=%.2fs geometry=%.2fs total=%.2fs",
+            t_extract - t0, t_ocr - t_extract, t_geom - t_ocr, t_geom - t0,
+        )
         dbg["seg"] = seg
+        dbg["timing"] = {
+            "extract": round(t_extract - t0, 2),
+            "ocr_wait": round(t_ocr - t_extract, 2),
+            "geometry": round(t_geom - t_ocr, 2),
+        }
         return self._assemble(meta, geom), dbg, meta
 
     def predict_task(self, task, kph=None, meta=None):
@@ -148,18 +178,37 @@ class CricketMiner:
         move). Returns (window_folder, seg_debug)."""
         out = _SCRATCH / ("miner_" + video_path.stem[:12])
         out.mkdir(parents=True, exist_ok=True)
-        for old in out.glob("*.jpg"):
-            old.unlink()
+        # Pass 1: decode straight into the small in-memory inference cache (no
+        # JPG round-trip). The delivery SEARCH resolution adapts to clip length:
+        # normal clips run full 288x512 so the few-px ball stays detectable
+        # (and the solve is bit-identical to the full-res path); only very long
+        # footage falls back to a coarse pass to stay under the 30s gate instead
+        # of timing out. geometry() always runs full-res on the chosen window.
+        tx0 = time.perf_counter()
         cap = cv2.VideoCapture(str(video_path))
-        i = 0
+        n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        SEARCH_HW = (160, 288) if n_total > 600 else (288, 512)
+        cache, dims = [], None
         while True:
             ok, fr = cap.read()
             if not ok:
                 break
-            cv2.imwrite(str(out / f"{i:06d}.jpg"), fr)
-            i += 1
+            if dims is None:
+                dims = fr.shape[:2]
+            cache.append(frame_to_cache(fr, out_hw=SEARCH_HW))
         cap.release()
-        ball, _, _ = infer_task(self.mb, out, self.device, self.nfb, thresh=0.8)
+        i = len(cache)
+        tx1 = time.perf_counter()
+        if dims is None:
+            return out, dict(n_frames=0, n_ball=0)
+        h0, w0 = dims
+        ball, _, _ = infer_cache(self.mb, cache, self.device, self.nfb, h0, w0,
+                                 out_hw=SEARCH_HW, thresh=0.8)
+        tx2 = time.perf_counter()
+        logger.info(
+            "[timing] extract.decode=%.2fs extract.infer=%.2fs (n_frames=%d)",
+            tx1 - tx0, tx2 - tx1, i,
+        )
         hit = sorted(f for f in ball if ball[f].x is not None)
         seg = dict(n_frames=i, n_ball=len(hit))
         if len(hit) < 5:
@@ -198,10 +247,18 @@ class CricketMiner:
         win.mkdir(exist_ok=True)
         for old in win.glob("*.jpg"):
             old.unlink()
-        frames = sorted(out.glob("*.jpg"))
-        for k, fp in enumerate(frames):
+        # Pass 2: re-decode and write only the ~12 window frames at full res
+        # for the geometry stage (keypoints + per-window ball).
+        cap = cv2.VideoCapture(str(video_path))
+        k = 0
+        while True:
+            ok, fr = cap.read()
+            if not ok:
+                break
             if lo <= k <= hi:
-                cv2.imwrite(str(win / fp.name), cv2.imread(str(fp)))
+                cv2.imwrite(str(win / f"{k:06d}.jpg"), fr)
+            k += 1
+        cap.release()
         return win, seg
 
     @staticmethod
