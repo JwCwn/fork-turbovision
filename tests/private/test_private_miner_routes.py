@@ -32,13 +32,16 @@ async def test_handle_challenge_soccer_mode_returns_predictions():
 @pytest.mark.asyncio
 async def test_handle_challenge_cricket_mode_returns_prediction():
     request = ChallengeRequest(challenge_id="c1", video_url="https://example.com/v.mp4")
+    fake_video_path = Path("/tmp/fake.mp4")
 
     with (
         patch("scorevision.miner.private_track.routes.MINER_MODE", "cricket_delivery"),
+        patch("scorevision.miner.private_track.routes.download_video", new=AsyncMock(return_value=fake_video_path)),
         patch(
             "scorevision.miner.private_track.routes.predict_cricket_delivery",
             return_value=CricketDeliveryPrediction(kph=130.0, bounce_x=6.0, stump_y=0.2),
         ),
+        patch("scorevision.miner.private_track.routes.delete_video"),
     ):
         response = await handle_challenge(request)
 

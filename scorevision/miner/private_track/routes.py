@@ -6,7 +6,8 @@ from scorevision.utils.schemas import ChallengeRequest, ChallengeResponse, Predi
 from scorevision.miner.private_track.logging import logger
 
 # TODO: choose a single mode per miner deployment: "soccer_action" or "cricket_delivery".
-MINER_MODE = "soccer_action"
+# MINER_MODE = "soccer_action"
+MINER_MODE = "cricket_delivery"
 
 
 async def handle_challenge(request: ChallengeRequest) -> ChallengeResponse:
@@ -16,7 +17,8 @@ async def handle_challenge(request: ChallengeRequest) -> ChallengeResponse:
 
     try:
         if MINER_MODE == "cricket_delivery":
-            prediction = predict_cricket_delivery(request)
+            video_path = await download_video(request.video_url)
+            prediction = predict_cricket_delivery(video_path)
             processing_time = time.perf_counter() - start_time
             logger.info(
                 "Cricket challenge completed: %s, time: %.1fs",

@@ -1,6 +1,21 @@
 from pathlib import Path
+
 from scorevision.miner.private_track.video import get_frame_count
-from scorevision.utils.schemas import ChallengeRequest, CricketDeliveryPrediction, FramePrediction
+from scorevision.miner.private_track.logging import logger
+from scorevision.utils.schemas import CricketDeliveryPrediction, FramePrediction
+
+# Lazily-built singleton so model weights load once per container (not per request).
+_CRICKET_MINER = None
+
+
+def _get_cricket_miner():
+    global _CRICKET_MINER
+    if _CRICKET_MINER is None:
+        from scorevision.miner.private_track.cricket.inference import CricketMiner
+        logger.info("Loading cricket models (ckpt_wb + ckpt_kp)...")
+        _CRICKET_MINER = CricketMiner()
+        logger.info("Cricket models loaded on device=%s", _CRICKET_MINER.device)
+    return _CRICKET_MINER
 
 
 def predict_actions(video_path: Path) -> list[FramePrediction]:
@@ -15,30 +30,20 @@ def predict_actions(video_path: Path) -> list[FramePrediction]:
     return predictions
 
 
-def predict_cricket_delivery(request: ChallengeRequest) -> CricketDeliveryPrediction:
-    # TODO: Replace this stub with actual cricket model inference.
-    return CricketDeliveryPrediction(
-        match="dummy-cricket-stub",
-        matchid=-1,
-        inningsid=-1,
-        overid=-1,
-        ball_in_over=-1,
-        ballid=-1,
-        xlsx_overs="stub",
-        scorecard_overs="stub",
-        kph=-1.0,
-        release_y=-999.0,
-        release_z=-999.0,
-        bounce_x=-999.0,
-        bounce_y=-999.0,
-        impact_x=-999.0,
-        impact_y=-999.0,
-        impact_z=-999.0,
-        interception_distance=-999.0,
-        stump_y=-999.0,
-        stump_z=-999.0,
-        swing_angle=-999.0,
-        deviation=-999.0,
-        runs=-1,
-        wickets=-1,
-    )
+def predict_cricket_delivery(video_path: Path) -> CricketDeliveryPrediction:
+    """Run the prepared ball-tracking + physics pipeline on a downloaded video.
+
+    Returns a CricketDeliveryPrediction with every scored field; geometry comes
+    from the physics solve, meta/kph from the broadcast overlay (OCR). Missing
+    fields are emitted as None and simply score 0, so a partial solve never hurts.
+    """
+    miner = _get_cricket_miner()
+    try:
+        pred, dbg, meta = miner.predict_video(video_path)
+        logger.info("Cricket solve: %s", dbg)
+    except Exception as e:
+        # Never 500 the validator on hard footage; return an all-None row (score 0).
+        logger.error("Cricket inference failed, returning empty prediction: %s", e)
+        pred = {}
+
+    return CricketDeliveryPrediction(**pred)
