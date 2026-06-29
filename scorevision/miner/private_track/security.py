@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import time
 
 from fastapi import Depends, Header, HTTPException, Request
 from fiber.chain import signatures
@@ -10,9 +9,6 @@ from scorevision.utils.schemas import ChallengeRequest
 
 BLACKLIST_ENABLED = os.environ.get("BLACKLIST_ENABLED", "true").lower() in ("true", "1", "yes")
 VERIFY_ENABLED = os.environ.get("VERIFY_ENABLED", "true").lower() in ("true", "1", "yes")
-
-# Reject a signature whose nonce is too far from now (replay + clock-skew guard).
-_NONCE_WINDOW_NS = 180 * 1_000_000_000
 
 
 async def verify_request(
@@ -31,14 +27,10 @@ async def verify_request(
     The validator signs request.model_dump_json() but ships the body via httpx
     (json=model_dump()), so the wire bytes can differ in whitespace/ordering.
     We therefore try the re-serialized canonical form AND the raw body.
-    """
-    try:
-        nonce_ns = int(nonce)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=401, detail="Invalid nonce")
-    if abs(time.time_ns() - nonce_ns) > _NONCE_WINDOW_NS:
-        raise HTTPException(status_code=401, detail="Stale nonce")
 
+    No clock-based nonce check: validator and miner clocks can differ by a lot
+    (observed ~1 day), which would otherwise reject every challenge as "stale".
+    """
     body = await request.body()
     candidates: list[bytes] = []
     try:
