@@ -272,6 +272,10 @@ class CricketMiner:
         for f in GEOM_FIELDS:
             v = geom.get(f) if geom else None
             pred[f] = round(float(v), 4) if (v is not None and np.isfinite(v) and abs(v) < 1e4) else None
-        if geom and meta.get("kph"):
-            pred["kph"] = round(float(meta["kph"]), 2)  # trust overlay over BA echo
+        # kph is read straight off the broadcast overlay, so emit it whenever OCR
+        # found it — even when the physics solve fails. It overrides the BA echo
+        # when geometry succeeded, and is the only core field we can score when it
+        # didn't (partial credit: emitting is never worse than null).
+        if meta.get("kph"):
+            pred["kph"] = round(float(meta["kph"]), 2)
         return pred
