@@ -136,9 +136,13 @@ def residuals(p, obs, cx, cy, fps, w=(1.0, 1.0, 2.0, 0.05), kph_obs=None):
 
 def fit(obs, cx, cy, fps, init, kph_obs=None):
     p0 = np.clip(np.array(init, float), LB + 1e-6, UB - 1e-6)
+    # max_nfev 8000 -> 2000: a GOOD solve converges in a few hundred evals (clean
+    # clips fit in ~3 s). Only a DEGENERATE solve keeps iterating to the cap, and
+    # its result is discarded by the physical-range guard anyway -- so the extra
+    # evals just burned ~23 s of wall-clock (timeout risk). Cap it low.
     return least_squares(residuals, p0, args=(obs, cx, cy, fps),
                          kwargs={"kph_obs": kph_obs}, method="trf",
-                         bounds=(LB, UB), loss="soft_l1", f_scale=2.0, max_nfev=8000)
+                         bounds=(LB, UB), loss="soft_l1", f_scale=2.0, max_nfev=2000)
 
 
 IMPACT_X = 1.22  # popping crease (m from stumps): default batter interception plane
