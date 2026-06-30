@@ -15,8 +15,160 @@ import torch
 from scorevision.miner.private_track.cricket.tracknet.model import TrackNetV2
 from scorevision.miner.private_track.cricket.tracknet.infer import infer_task
 from scorevision.miner.private_track.cricket.tracknet.heatmap import heatmap_peak
+from scorevision.miner.private_track.cricket.tracknet.cvat_io import BallLabel
 from scorevision.miner.private_track.cricket.keypoints.dataset import KP_NAMES
 from scorevision.miner.private_track.cricket.physics import bundle as B
+
+
+def select_ball_track(cands, w0, h0, max_gap=6, max_step_frac=0.12,
+                      y_up_frac=0.06, min_chain=4, min_travel_frac=0.03,
+                      conf_floor=0.5, strong_conf=0.7, min_strong=2, accel_frac=0.06):
+    """Pick one ball per frame from top-k candidate sets -> {frame: BallLabel}.
+
+    The ball is the CONFIDENT, smooth, descending arc through the candidates --
+    not merely the farthest-travelling chain. (Travel maximisation wandered onto
+    weak distractors and missed slow real deliveries.) So we maximise the summed
+    node reward max(0, conf - conf_floor) along a chain constrained to be smooth
+    (bounded velocity), low-acceleration, and mostly descending in image-y, via a
+    DP over the candidate DAG ordered by frame. We then accept the highest-scoring
+    chain that also actually MOVES (min_travel, rejects static high-conf logos)
+    and has real support (>= min_strong nodes above strong_conf).
+
+    Returns a full {frame: BallLabel} dict (None where no ball chosen), so the
+    existing clean_ball / delivery_window / build_obs path is unchanged."""
+    frames_all = sorted(cands)
+    nodes = []  # (frame, x, y, conf)
+    by_frame: dict[int, list[int]] = {}
+    for f in frames_all:
+        for (x, y, c) in cands[f]:
+            by_frame.setdefault(f, []).append(len(nodes))
+            nodes.append((f, x, y, c))
+    out = {f: BallLabel(f, None, None, 0) for f in frames_all}
+    if len(nodes) < min_chain:
+        return out
+    max_step = max_step_frac * w0
+    accel_max = accel_frac * w0
+    y_up = y_up_frac * h0
+    reward = [max(0.0, c - conf_floor) for (_, _, _, c) in nodes]
+    dp = list(reward)                # best summed reward of a chain ending here
+    trav = [0.0] * len(nodes)        # pure travel (for the move/static guard)
+    par = [-1] * len(nodes)
+    vel = [(0.0, 0.0)] * len(nodes)  # per-frame velocity of the edge INTO this node
+    order = sorted(range(len(nodes)), key=lambda j: nodes[j][0])
+    for j in order:
+        fj, xj, yj, _ = nodes[j]
+        for fi in range(fj - max_gap, fj):
+            for i in by_frame.get(fi, ()):
+                _, xi, yi, _ = nodes[i]
+                if yj < yi - y_up:                  # must not rise more than bounce slack
+                    continue
+                gap = fj - fi
+                dx, dy = xj - xi, yj - yi
+                d = (dx * dx + dy * dy) ** 0.5
+                if d > max_step * gap:              # smoothness: bounded per-frame velocity
+                    continue
+                vij = (dx / gap, dy / gap)
+                # Acceleration continuity: a real arc changes velocity slowly, so
+                # a static-cluster -> ball jump (sudden velocity reversal) is
+                # rejected even though its distance is within bounds.
+                if par[i] != -1:
+                    vx, vy = vel[i]
+                    if ((vij[0] - vx) ** 2 + (vij[1] - vy) ** 2) ** 0.5 > accel_max:
+                        continue
+                if dp[i] + reward[j] > dp[j]:
+                    dp[j] = dp[i] + reward[j]
+                    trav[j] = trav[i] + d
+                    par[j] = i
+                    vel[j] = vij
+    # Accept the highest-scoring chain that also moves and has strong support;
+    # if the top chain is a static high-conf cluster it fails the guards and we
+    # fall through to the next-best valid chain instead of giving up.
+    min_travel = min_travel_frac * w0
+    for end in sorted(range(len(nodes)), key=lambda j: dp[j], reverse=True):
+        chain = []
+        n = end
+        while n != -1:
+            chain.append(n)
+            n = par[n]
+        if len(chain) < min_chain or trav[end] < min_travel:
+            continue
+        if sum(1 for j in chain if nodes[j][3] >= strong_conf) < min_strong:
+            continue
+        for j in chain:
+            f, x, y, c = nodes[j]
+            out[f] = BallLabel(f, x, y, 1 if c >= 0.7 else 2)
+        break
+    return out
+
+
+def _validate_stump_template(agg):
+    """Drop geometrically-impossible stump keypoints using the known rigid rig.
+
+    The 3 stumps are a short, near-horizontal base line with verticals rising to
+    tops directly above. Misidentified keypoints (a 'top' at base height, or
+    bases whose left/mid/right order is scrambled) make the bundle solve diverge,
+    so we remove them BEFORE the solve -> an honest no-solve instead of garbage."""
+    sides = ["left", "mid", "right"]
+    bpts = {s: agg[f"bs_{s}_base"] for s in sides if f"bs_{s}_base" in agg}
+    tpts = {s: agg[f"bs_{s}_top"] for s in sides if f"bs_{s}_top" in agg}
+    bad = set()
+    # (1) bases roughly collinear: drop a base whose y is a large outlier vs the
+    #     horizontal spread of the base line.
+    if len(bpts) >= 2:
+        my = float(np.median([p[1] for p in bpts.values()]))
+        span = max((abs(p[0] - q[0]) for p in bpts.values() for q in bpts.values()), default=1.0)
+        for s, p in bpts.items():
+            if abs(p[1] - my) > 0.5 * span + 20:
+                bad.add(f"bs_{s}_base")
+    # (2) each top must sit clearly ABOVE the base line (smaller image-y).
+    good_base_ys = [p[1] for s, p in bpts.items() if f"bs_{s}_base" not in bad]
+    if good_base_ys:
+        base_y = float(np.median(good_base_ys))
+        for s, p in tpts.items():
+            if p[1] >= base_y - 20:
+                bad.add(f"bs_{s}_top")
+    # (3) base left/mid/right must be x-monotonic; if mid isn't between the
+    #     others the labels are unreliable -> drop the whole base triple.
+    vb = {s: bpts[s] for s in sides if s in bpts and f"bs_{s}_base" not in bad}
+    if len(vb) == 3:
+        xl, xm, xr = vb["left"][0], vb["mid"][0], vb["right"][0]
+        if not (xl < xm < xr or xl > xm > xr):
+            bad |= {f"bs_{s}_base" for s in sides}
+    return {k: v for k, v in agg.items() if k not in bad}
+
+
+def detect_keypoints_robust(model_kp, task: Path, device, out_hw=(288, 512),
+                            thresh=0.25, min_frac=0.30):
+    """Temporal-aggregated keypoints: detect per frame at a LOW threshold, then
+    keep only keypoints seen consistently (>= min_frac of frames) and fix each at
+    its temporal-median position, broadcast to every frame.
+
+    Stumps are static within the short delivery window, so consolidating over
+    time recovers the >=4-5 reliable stumps the bundle needs (per-frame 0.4
+    thresholding was dropping to 3) while temporal median rejects sporadic FPs."""
+    H, W = out_hw
+    frames = sorted(task.glob("*.jpg"))
+    h0, w0 = cv2.imread(str(frames[0])).shape[:2]
+    sx, sy = w0 / W, h0 / H
+    per = {n: [] for n in KP_NAMES}
+    with torch.no_grad():
+        for fp in frames:
+            im = cv2.cvtColor(cv2.resize(cv2.imread(str(fp)), (W, H)), cv2.COLOR_BGR2RGB)
+            x = im.astype(np.float32).transpose(2, 0, 1)[None] / 255.0
+            hm = model_kp(torch.from_numpy(x).to(device))[0].cpu().numpy()
+            for k, name in enumerate(KP_NAMES):
+                pk = heatmap_peak(hm[k], thresh=thresh)
+                if pk:
+                    per[name].append((pk[0] * sx, pk[1] * sy))
+    nfr = len(frames)
+    need = max(2, int(min_frac * nfr))
+    agg = {}
+    for name, pts in per.items():
+        if len(pts) >= need:
+            arr = np.asarray(pts, float)
+            agg[name] = (float(np.median(arr[:, 0])), float(np.median(arr[:, 1])))
+    agg = _validate_stump_template(agg)
+    return {i: dict(agg) for i in range(nfr)}, w0, h0
 
 
 def detect_keypoints(model_kp, task: Path, device, out_hw=(288, 512), thresh=0.4):
@@ -140,7 +292,13 @@ def build_obs(ball, kps):
         o = {}
         kp = kps.get(f, {})
         st = {n: np.array(kp[n]) for n in B.STUMP_3D if n in kp}
-        if len(st) >= 4:
+        # >=2 (was 4): the batsman/umpire usually occlude the stumps, so only 2-3
+        # keypoints are visible per frame across broadcasts. _validate_stump_template
+        # already rejects mis-identified sets (-> 0), and the physical-range output
+        # guard nulls any degenerate (e.g. vertical-unconstrained) solve, so it is
+        # safe to attempt calibration from as few as 2 consistent stumps + the
+        # pitch edges rather than discarding the delivery outright.
+        if len(st) >= 2:
             o["stumps"] = st
         pe = {k: np.array(kp[k]) for k in ["pitch_left_far", "pitch_left_near",
                                            "pitch_right_far", "pitch_right_near"] if k in kp}

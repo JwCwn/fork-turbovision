@@ -23,7 +23,9 @@ import torch
 
 from scorevision.miner.private_track.logging import logger
 from scorevision.miner.private_track.cricket.tracknet.model import TrackNetV2
-from scorevision.miner.private_track.cricket.tracknet.infer import infer_task, infer_cache, frame_to_cache
+from scorevision.miner.private_track.cricket.tracknet.infer import (
+    frame_to_cache, infer_task_topk, infer_cache_topk,
+)
 from scorevision.miner.private_track.cricket.physics import bundle as B
 from scorevision.miner.private_track.cricket.physics.run_delivery import init_params
 from scorevision.miner.private_track.cricket.physics import pipeline as PL
@@ -32,6 +34,12 @@ _PKG_DIR = Path(__file__).resolve().parent
 _DEFAULT_BALL = _PKG_DIR / "tracknet" / "ckpt_wb.pt"
 _DEFAULT_KP = _PKG_DIR / "keypoints" / "ckpt_kp.pt"
 _SCRATCH = Path(tempfile.gettempdir()) / "cricket_miner"
+# The live delivery (release -> batter) sits in the opening seconds of every
+# challenge clip; the rest is replays / other cameras. Geometry only searches
+# this opening window. OCR (kph + metadata) is scanned separately and wider.
+# 7 s covers release (~3-4 s) through impact (~6 s) with margin, while staying
+# before the first replay; raise only if a clip's live delivery runs later.
+DELIVERY_SECS = 7.0
 
 # The 6 core + 7 secondary geometry fields produced by the physics stage.
 GEOM_FIELDS = [
@@ -39,6 +47,16 @@ GEOM_FIELDS = [
     "release_y", "release_z", "bounce_y", "impact_x", "impact_y",
     "impact_z", "interception_distance",
 ]
+
+# Physical envelopes (metres / degrees) used to reject degenerate solves: a value
+# outside its range is reconstruction garbage, not a real estimate, so it is nulled.
+_PHYS_RANGE = {
+    "bounce_x": (-2.0, 25.0), "stump_y": (-3.0, 3.0), "stump_z": (-1.0, 4.0),
+    "swing_angle": (-25.0, 25.0), "deviation": (-25.0, 25.0),
+    "release_y": (-3.0, 3.0), "release_z": (0.0, 4.0), "bounce_y": (-3.0, 3.0),
+    "impact_y": (-3.0, 3.0), "impact_z": (-1.0, 4.0),
+    "interception_distance": (-25.0, 25.0),
+}
 
 
 class CricketMiner:
@@ -62,9 +80,12 @@ class CricketMiner:
         h0, w0 = cv2.imread(str(frames[0])).shape[:2]
         cx, cy = w0 / 2.0, h0 / 2.0
         tg0 = time.perf_counter()
-        ball, _, _ = infer_task(self.mb, task, self.device, self.nfb, thresh=0.8)
+        # top-k ball candidates -> trajectory selection (robust to bright static
+        # distractors); temporal-aggregated keypoints (stable >=4-5 stumps).
+        bcands = infer_task_topk(self.mb, task, self.device, self.nfb)
+        ball = PL.select_ball_track(bcands, w0, h0)
         tg1 = time.perf_counter()
-        kps, _, _ = PL.detect_keypoints(self.mk, task, self.device)
+        kps, _, _ = PL.detect_keypoints_robust(self.mk, task, self.device)
         tg2 = time.perf_counter()
         ballw = PL.delivery_window(PL.clean_ball(ball))
         kpc = PL.clean_kps(kps)
@@ -109,7 +130,14 @@ class CricketMiner:
         return reasons
 
     # ---- OCR meta ------------------------------------------------------------
-    def ocr_meta(self, video_path: Path, win=(0.2, 0.8)):
+    def ocr_meta(self, video_path: Path, step_secs=1.0, max_samples=45):
+        """Read scoreboard metadata + the speed-gun kph from the overlay.
+
+        Unlike the geometry (first ~7 s only), the speed graphic flashes LATE
+        (~14 s) and briefly, so OCR walks the WHOLE clip at ~step_secs intervals
+        and STOPS as soon as kph is read (the persistent scoreboard metadata is
+        already captured in the first samples). `max_samples` bounds the cost on
+        long clips where no speed graphic ever appears."""
         from scorevision.miner.private_track.cricket.scorecard_ocr import (
             extract_band, ocr_tokens, parse_meta, parse_speed,
         )
@@ -117,19 +145,25 @@ class CricketMiner:
             from rapidocr_onnxruntime import RapidOCR
             self._ocr = RapidOCR()
         cap = cv2.VideoCapture(str(video_path))
-        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps_v = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        step = max(1, int(step_secs * fps_v))
         best = {}
-        for frac in np.linspace(win[0], win[1], 8):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(n * frac))
+        fi = 0; count = 0
+        while fi < max(n, 1) and count < max_samples:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
             ok, fr = cap.read()
             if not ok:
-                continue
+                break
             toks = ocr_tokens(self._ocr, extract_band(fr, 0.80))
             for k, v in parse_meta(toks).items():
                 best.setdefault(k, v)
+            if "kph" in best:
+                break  # speed found -> metadata already gathered, stop scanning
             s = parse_speed(toks)
             if s and "kph" not in best:
                 best["kph"] = s
+            fi += step; count += 1
         cap.release()
         return best
 
@@ -178,18 +212,26 @@ class CricketMiner:
         move). Returns (window_folder, seg_debug)."""
         out = _SCRATCH / ("miner_" + video_path.stem[:12])
         out.mkdir(parents=True, exist_ok=True)
-        # Pass 1: decode straight into the small in-memory inference cache (no
-        # JPG round-trip). The delivery SEARCH resolution adapts to clip length:
-        # normal clips run full 288x512 so the few-px ball stays detectable
-        # (and the solve is bit-identical to the full-res path); only very long
-        # footage falls back to a coarse pass to stay under the 30s gate instead
-        # of timing out. geometry() always runs full-res on the chosen window.
+        # Clear any stale frames from a prior run: the no-window paths return this
+        # dir, and geometry() must NOT solve on leftover frames (that produced
+        # bogus high-rms "solves"). Pass 1 writes nothing here, so on no-window
+        # `out` stays empty -> geometry returns None cleanly.
+        for old in out.glob("*.jpg"):
+            old.unlink()
+        # Pass 1: decode the LIVE DELIVERY ONLY (first DELIVERY_SECS) into the
+        # in-memory inference cache. The live ball + batter-end stumps + pitch all
+        # appear in the opening few seconds; everything after is replays / slow-mo
+        # / other cameras whose different geometry corrupts the solve. Restricting
+        # to the opening window both removes that distractor footage AND keeps the
+        # search tiny (~125 frames), so it always runs full-res 288x512 (best ball
+        # recall) and finishes in seconds instead of scanning the whole clip.
         tx0 = time.perf_counter()
         cap = cv2.VideoCapture(str(video_path))
-        n_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        SEARCH_HW = (160, 288) if n_total > 600 else (288, 512)
+        fps_v = cap.get(cv2.CAP_PROP_FPS) or fps or 25.0
+        max_frames = int(DELIVERY_SECS * fps_v)
+        SEARCH_HW = (288, 512)
         cache, dims = [], None
-        while True:
+        while len(cache) < max_frames:
             ok, fr = cap.read()
             if not ok:
                 break
@@ -202,8 +244,9 @@ class CricketMiner:
         if dims is None:
             return out, dict(n_frames=0, n_ball=0)
         h0, w0 = dims
-        ball, _, _ = infer_cache(self.mb, cache, self.device, self.nfb, h0, w0,
-                                 out_hw=SEARCH_HW, thresh=0.8)
+        bcands = infer_cache_topk(self.mb, cache, self.device, self.nfb, h0, w0,
+                                  out_hw=SEARCH_HW)
+        ball = PL.select_ball_track(bcands, w0, h0)
         tx2 = time.perf_counter()
         logger.info(
             "[timing] extract.decode=%.2fs extract.infer=%.2fs (n_frames=%d)",
@@ -251,7 +294,7 @@ class CricketMiner:
         # for the geometry stage (keypoints + per-window ball).
         cap = cv2.VideoCapture(str(video_path))
         k = 0
-        while True:
+        while k <= hi:
             ok, fr = cap.read()
             if not ok:
                 break
@@ -271,7 +314,16 @@ class CricketMiner:
         )
         for f in GEOM_FIELDS:
             v = geom.get(f) if geom else None
-            pred[f] = round(float(v), 4) if (v is not None and np.isfinite(v) and abs(v) < 1e4) else None
+            ok = v is not None and np.isfinite(v) and abs(v) < 1e4
+            # Physical-range guard: a degenerate solve (e.g. 3 collinear bases, no
+            # vertical reference) can fit the image well yet reconstruct absurd 3D
+            # (stump_z=-18 m). Null any field outside its physical envelope so a
+            # bad solve falls back to "no geometry" instead of emitting garbage
+            # that pretends to be an answer.
+            lo_hi = _PHYS_RANGE.get(f)
+            if ok and lo_hi and not (lo_hi[0] <= v <= lo_hi[1]):
+                ok = False
+            pred[f] = round(float(v), 4) if ok else None
         # kph is read straight off the broadcast overlay, so emit it whenever OCR
         # found it — even when the physics solve fails. It overrides the BA echo
         # when geometry succeeded, and is the only core field we can score when it

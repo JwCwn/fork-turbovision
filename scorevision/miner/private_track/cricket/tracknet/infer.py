@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from .model import TrackNetV2
-from .heatmap import heatmap_peak
+from .heatmap import heatmap_peak, heatmap_topk
 from .cvat_io import BallLabel, write_cvat_video_xml
 
 
@@ -116,6 +116,61 @@ def infer_cache(model, cache, device, n_frames, h0, w0,
                                    1 if peak[2] >= 0.7 else 2)
     n_hit = sum(1 for v in labels.values() if v.x is not None)
     return labels, n_hit, len(cache)
+
+
+def _accumulate(model, cache, device, n_frames, batch=32):
+    """Run sliding n_frames windows over `cache` and return per-frame averaged
+    heatmaps: {cf: mean_hm}. Shared by the single-peak and top-k decoders."""
+    from collections import defaultdict as _dd
+    acc = _dd(list)
+    n_windows = len(cache) - n_frames + 1
+    with torch.no_grad():
+        for start in range(0, n_windows, batch):
+            stop = min(start + batch, n_windows)
+            xs = [np.concatenate(cache[i:i + n_frames], axis=0) for i in range(start, stop)]
+            xt = torch.from_numpy(np.stack(xs, axis=0)).to(device)
+            y = model(xt).cpu().numpy()
+            for bi, i in enumerate(range(start, stop)):
+                for k in range(n_frames):
+                    acc[i + k].append(y[bi, k])
+    return {cf: (np.mean(hms, axis=0) if hms else None) for cf, hms in acc.items()}
+
+
+def infer_cache_topk(model, cache, device, n_frames, h0, w0, out_hw=(288, 512),
+                     thresh: float = 0.5, k: int = 4, min_dist: int = 6):
+    """Top-k ball candidates per frame, in ORIGINAL pixels.
+
+    Returns {frame: [(x, y, conf), ...]} (strongest-first, empty list if none).
+    Same accumulation math as infer_cache but keeps several blobs so a faint
+    real ball is not lost to a brighter distractor."""
+    _set_det()
+    if len(cache) < n_frames:
+        return {}
+    H, W = out_hw
+    sx, sy = w0 / W, h0 / H
+    mean_hms = _accumulate(model, cache, device, n_frames, batch=32)
+    cands: dict[int, list[tuple[float, float, float]]] = {}
+    for cf in range(len(cache)):
+        hm = mean_hms.get(cf)
+        if hm is None:
+            cands[cf] = []
+            continue
+        cands[cf] = [(px * sx, py * sy, c)
+                     for (px, py, c) in heatmap_topk(hm, thresh=thresh, k=k, min_dist=min_dist)]
+    return cands
+
+
+def infer_task_topk(model, task_dir: Path, device, n_frames, out_hw=(288, 512),
+                    thresh: float = 0.5, k: int = 4, min_dist: int = 6):
+    """Top-k ball candidates per frame for a folder of JPGs (see infer_cache_topk)."""
+    frames = sorted(task_dir.glob("*.jpg"))
+    if len(frames) < n_frames:
+        return {}
+    H, W = out_hw
+    h0, w0 = cv2.imread(str(frames[0])).shape[:2]
+    cache = [frame_to_cache(cv2.imread(str(fp)), out_hw=out_hw) for fp in frames]
+    return infer_cache_topk(model, cache, device, n_frames, h0, w0,
+                            out_hw=out_hw, thresh=thresh, k=k, min_dist=min_dist)
 
 
 def main():

@@ -50,6 +50,45 @@ def heatmap_peak(hm: np.ndarray, thresh: float = 0.5) -> tuple[float, float, flo
     return float(x), float(y), conf
 
 
+def heatmap_topk(hm: np.ndarray, thresh: float = 0.5, k: int = 4,
+                 min_dist: int = 6) -> list[tuple[float, float, float]]:
+    """Decode up to k peaks (x, y, conf) via iterative argmax + NMS suppression.
+
+    Unlike heatmap_peak (single global argmax), this keeps several candidate
+    blobs so a faint true ball survives even when a brighter distractor
+    (scoreboard digit, fielder) is present; the trajectory selector later picks
+    the candidate that forms a moving arc. Peaks are returned strongest-first."""
+    if hm.size == 0:
+        return []
+    work = hm.astype(np.float32).copy()
+    peaks: list[tuple[float, float, float]] = []
+    for _ in range(k):
+        idx = int(np.argmax(work))
+        y, x = np.unravel_index(idx, work.shape)
+        conf = float(work[y, x])
+        if conf < thresh:
+            break
+        # sub-pixel refinement via local centroid on the ORIGINAL map
+        r = 2
+        y0, y1 = max(0, y - r), min(hm.shape[0], y + r + 1)
+        x0, x1 = max(0, x - r), min(hm.shape[1], x + r + 1)
+        patch = hm[y0:y1, x0:x1]
+        s = float(patch.sum())
+        if s > 1e-6:
+            ys = np.arange(y0, y1)
+            xs = np.arange(x0, x1)
+            cy = float((patch.sum(1) * ys).sum() / s)
+            cx = float((patch.sum(0) * xs).sum() / s)
+        else:
+            cx, cy = float(x), float(y)
+        peaks.append((cx, cy, conf))
+        # suppress a min_dist neighbourhood so the next argmax is a distinct blob
+        sy0, sy1 = max(0, y - min_dist), min(work.shape[0], y + min_dist + 1)
+        sx0, sx1 = max(0, x - min_dist), min(work.shape[1], x + min_dist + 1)
+        work[sy0:sy1, sx0:sx1] = 0.0
+    return peaks
+
+
 if __name__ == "__main__":
     hm = gaussian_heatmap(288, 512, 100.0, 50.0, sigma=3.0)
     assert abs(hm.max() - 1.0) < 1e-5
