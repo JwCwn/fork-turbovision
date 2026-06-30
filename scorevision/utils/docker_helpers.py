@@ -86,7 +86,10 @@ def run_container(
     volumes: list[str] | None = None,
 ) -> tuple[str | None, str | None]:
     logger.info("Running container: %s on port %d", image.full_name, port)
-    cmd = ["docker", "run", "-p", f"{port}:{port}"]
+    # The cricket/football miner runs CUDA models; without --gpus the container
+    # silently falls back to CPU (observed in production: 470 s/challenge -> timeout).
+    # Requesting the GPU here fails loudly on a mis-set host instead of degrading.
+    cmd = ["docker", "run", "--gpus", "all", "-p", f"{port}:{port}"]
 
     if env_file and env_file.exists():
         cmd.extend(["--env-file", str(env_file)])
