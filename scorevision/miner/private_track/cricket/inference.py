@@ -95,8 +95,14 @@ class CricketMiner:
         obs = {f - fr0: o for f, o in PL.build_obs(ballw, kpc).items()}
         nb = sum("ball" in o for o in obs.values())
         ns = sum("stumps" in o for o in obs.values())
-        if nb < 4 or ns < 3:
-            return None, dict(reason=f"insufficient det ball={nb} stumps={ns}")
+        npi = sum("pitch" in o for o in obs.values())
+        # PITCH-PRIMARY: the batter/umpire occlude the stumps on most clips, but the
+        # pitch is a known metric RECTANGLE that stays visible. Unlike 3 collinear
+        # stump bases (degenerate), a 2D pitch rectangle fully fixes the camera->ground
+        # pose (incl. height); vertical scale then comes from the ball + gravity + kph.
+        # So accept the solve when EITHER enough stumps OR enough pitch frames exist.
+        if nb < 4 or (ns < 3 and npi < 3):
+            return None, dict(reason=f"insufficient det ball={nb} stumps={ns} pitch={npi}")
         sol = B.fit(obs, cx, cy, fps, init_params(cx, cy, kph), kph_obs=kph)
         tg3 = time.perf_counter()
         logger.info(
@@ -109,7 +115,7 @@ class CricketMiner:
         f = B.fields_from(prm, fps, kph_obs=kph)
         dbg = dict(rms=rms, focal=float(prm["f"]),
                    camC=[round(float(v), 1) for v in prm["C"]], n_ball=nb, n_stump=ns,
-                   res=f"{w0}x{h0}")
+                   n_pitch=npi, res=f"{w0}x{h0}")
         dbg["low_confidence"] = self._low_conf(f, rms, ns)
         return f, dbg
 
@@ -144,11 +150,17 @@ class CricketMiner:
         if self._ocr is None:
             from rapidocr_onnxruntime import RapidOCR
             self._ocr = RapidOCR()
+        from collections import Counter, defaultdict
         cap = cv2.VideoCapture(str(video_path))
         n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps_v = cap.get(cv2.CAP_PROP_FPS) or 25.0
         step = max(1, int(step_secs * fps_v))
-        best = {}
+        # Metadata is voted (most-common) over the DELIVERY window only — runs/overs
+        # advance later in the clip, so a whole-clip vote would drift off the ball we
+        # are scored on. kph is taken from its first plausible reading anywhere.
+        meta_cutoff = int(8.0 * fps_v)
+        votes = defaultdict(Counter)
+        kph = None
         fi = 0; count = 0
         while fi < max(n, 1) and count < max_samples:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
@@ -156,15 +168,18 @@ class CricketMiner:
             if not ok:
                 break
             toks = ocr_tokens(self._ocr, extract_band(fr, 0.80))
-            for k, v in parse_meta(toks).items():
-                best.setdefault(k, v)
-            if "kph" in best:
-                break  # speed found -> metadata already gathered, stop scanning
-            s = parse_speed(toks)
-            if s and "kph" not in best:
-                best["kph"] = s
+            if fi <= meta_cutoff:
+                for k, v in parse_meta(toks).items():
+                    votes[k][v] += 1
+            if kph is None:
+                kph = parse_speed(toks)
+            if kph is not None and fi > meta_cutoff:
+                break  # have the speed and the delivery-window metadata is covered
             fi += step; count += 1
         cap.release()
+        best = {k: c.most_common(1)[0][0] for k, c in votes.items()}
+        if kph is not None:
+            best["kph"] = kph
         return best
 
     # ---- full prediction from a raw video -----------------------------------

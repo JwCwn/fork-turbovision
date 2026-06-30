@@ -34,7 +34,10 @@ import cv2
 
 FPS = 25
 
-_SCORE_RE = re.compile(r"(?<!\d)(\d{1,3})-(\d{1,2})(?!\d)")
+# both sides up to 3 digits: Australian notation writes wickets-RUNS ("3-103"),
+# so the second field can be a 3-digit run total. _disambiguate_score sorts out
+# which side is runs vs wickets via the wickets<=10 rule.
+_SCORE_RE = re.compile(r"(?<!\d)(\d{1,3})-(\d{1,3})(?!\d)")
 _OVERS_RE = re.compile(r"(?:overs?\s*)(\d{1,3})(?:\.(\d))?", re.I)
 _OVERS_BARE_RE = re.compile(r"(?<!\d)(\d{1,3})\.(\d)(?!\d)")  # fallback "54.4"
 _SPEED_RE = re.compile(r"(\d{2,3}(?:\.\d)?)\s*(?:km/?h|kmph|kph)", re.I)
@@ -70,37 +73,50 @@ def parse_speed(tokens: list[str]) -> float | None:
     return None
 
 
+def _disambiguate_score(a: int, b: int):
+    """An 'A-B' score token -> (runs, wickets) using the rule that WICKETS are
+    always 0..10. Broadcasts differ: English writes runs-wickets ('103-3'),
+    Australian writes wickets-runs ('3-103'), and bowler figures look the same
+    ('0-20'). The side that exceeds 10 must be runs; the <=10 side is wickets."""
+    if a > 10 and b <= 10:
+        return a, b          # runs-wickets (English)
+    if b > 10 and a <= 10:
+        return b, a          # wickets-runs (Australian)
+    if a <= 10 and b <= 10:
+        return a, b          # ambiguous early score -> assume runs-wickets
+    return None              # both > 10: not a valid score
+
+
 def parse_meta(tokens: list[str]) -> dict:
     """Extract team/runs/wickets/overs from a token list. Returns partial dict."""
     out: dict = {}
 
-    # --- team code + team score (disambiguate from bowler figures) -----------
+    # --- team score: collect every plausible A-B, disambiguate runs/wickets via
+    #     the wickets<=10 rule, then take the candidate with the MOST runs. The
+    #     batting team's cumulative total exceeds any single bowler's runs
+    #     conceded, so max-runs picks the team score over bowler figures. -------
     team = None
-    team_score = None  # (runs, wickets)
-    for i, tok in enumerate(tokens):
+    for tok in tokens:
         if _TEAMCODE_RE.match(tok) and tok not in {"SPEED", "KMH", "KPH"}:
-            # look at this token and the next for an adjacent score w/o parens
-            for j in (i, i + 1):
-                if j < len(tokens):
-                    cand = tokens[j]
-                    if "(" in cand:  # bowler figures like "0-38(15)" -> skip
-                        continue
-                    m = _SCORE_RE.search(cand)
-                    if m and team is None:
-                        team = tok
-                        team_score = (int(m.group(1)), int(m.group(2)))
-                        break
-            if team:
-                break
-    # fallback: first standalone score token without parentheses
-    if team_score is None:
-        for tok in tokens:
-            if "(" in tok:
+            team = tok
+            break
+    candidates = []
+    for tok in tokens:
+        if "(" in tok:  # bowler figures sometimes carry "(overs)" -> skip
+            continue
+        for m in _SCORE_RE.finditer(tok):
+            # Reject bowler figures, which max-runs would otherwise prefer when OCR
+            # mangles them into inflated totals: they are glued to the bowler NAME
+            # ("RABADA0-19", "NGIDI0-7") or carry a trailing ".overs" ("0-19.2",
+            # "0-192.1"). The team total stands alone with no adjacent letter/decimal.
+            if m.start() > 0 and tok[m.start() - 1].isalpha():
                 continue
-            m = _SCORE_RE.fullmatch(tok) or _SCORE_RE.search(tok)
-            if m:
-                team_score = (int(m.group(1)), int(m.group(2)))
-                break
+            if m.end() < len(tok) and tok[m.end()] == ".":
+                continue
+            rw = _disambiguate_score(int(m.group(1)), int(m.group(2)))
+            if rw is not None:
+                candidates.append(rw)
+    team_score = max(candidates, key=lambda rw: rw[0]) if candidates else None
 
     if team:
         out["team"] = team

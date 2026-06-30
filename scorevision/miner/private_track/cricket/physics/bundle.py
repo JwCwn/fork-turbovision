@@ -39,7 +39,11 @@ def pitch_3d(W):
             "pitch_left_near": (PITCH_L, -W, 0.), "pitch_right_near": (PITCH_L, W, 0.)}
 
 #            C0 C1 C2  r r r   w w w   a a a    f   P P P    V V V  tb  V V V    W
-LB = np.array([20,-10, 2, -4,-4,-4, -3,-3,-3, -6,-6,-6, 1200, 0,-6,0, -55,-12,-12,0.0, -55,-12,-5, 1.0])
+#   P0[0] (release x) lower bound 0 -> 12: the bowler always releases from THEIR end
+#   (x~17-22). With stumps absent (pitch-only), the bundle had a gauge ambiguity and
+#   flipped the trajectory (release at x=0, bounce off the pitch, V1[0]->0 -> nan);
+#   pinning release to the bowler half anchors the orientation the stumps used to give.
+LB = np.array([20,-10, 2, -4,-4,-4, -3,-3,-3, -6,-6,-6, 1200, 12,-6,0, -55,-12,-12,0.0, -55,-12,-5, 1.0])
 UB = np.array([75, 10,25,  4, 4, 4,  3, 3, 3,  6, 6, 6, 7000,25, 6,6,   0, 12,  8,1.6,   0, 12,22, 2.6])
 
 
