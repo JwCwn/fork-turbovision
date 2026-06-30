@@ -96,12 +96,12 @@ class CricketMiner:
         nb = sum("ball" in o for o in obs.values())
         ns = sum("stumps" in o for o in obs.values())
         npi = sum("pitch" in o for o in obs.values())
-        # PITCH-PRIMARY: the batter/umpire occlude the stumps on most clips, but the
-        # pitch is a known metric RECTANGLE that stays visible. Unlike 3 collinear
-        # stump bases (degenerate), a 2D pitch rectangle fully fixes the camera->ground
-        # pose (incl. height); vertical scale then comes from the ball + gravity + kph.
-        # So accept the solve when EITHER enough stumps OR enough pitch frames exist.
-        if nb < 4 or (ns < 3 and npi < 3):
+        # Pitch-primary (solve from pitch when stumps absent) was tried in production
+        # and FAILED: with no stumps to anchor the batter-end origin, the elongated
+        # pitch quad leaves a gauge ambiguity and the solve goes degenerate (rms>60,
+        # release flipped to x=0, V1[0]->0) -> scored 0 AND took ~38 s. So require
+        # stumps again; stump-less clips fall back to the (independent) OCR floor.
+        if nb < 4 or ns < 3:
             return None, dict(reason=f"insufficient det ball={nb} stumps={ns} pitch={npi}")
         sol = B.fit(obs, cx, cy, fps, init_params(cx, cy, kph), kph_obs=kph)
         tg3 = time.perf_counter()
