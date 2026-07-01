@@ -33,6 +33,7 @@ from scorevision.miner.private_track.cricket.physics import pipeline as PL
 _PKG_DIR = Path(__file__).resolve().parent
 _DEFAULT_BALL = _PKG_DIR / "tracknet" / "ckpt_wb.pt"
 _DEFAULT_KP = _PKG_DIR / "keypoints" / "ckpt_kp.pt"
+_DEFAULT_LINES = _PKG_DIR / "lines" / "ckpt_lines.pt"
 _SCRATCH = Path(tempfile.gettempdir()) / "cricket_miner"
 # The live delivery (release -> batter) sits in the opening seconds of every
 # challenge clip; the rest is replays / other cameras. Geometry only searches
@@ -40,6 +41,13 @@ _SCRATCH = Path(tempfile.gettempdir()) / "cricket_miner"
 # 7 s covers release (~3-4 s) through impact (~6 s) with margin, while staying
 # before the first replay; raise only if a clip's live delivery runs later.
 DELIVERY_SECS = 7.0
+# The line calibration wants the WIDE delivery span (run-up through impact): the
+# bowler-end return creases are cleanest during the run-up wide shot, and a broad
+# viewpoint spread is what breaks the line-solve gauge ambiguity. The tight ball-arc
+# crop (good for the ball/stump path) is too narrow -> the line solve goes
+# degenerate. So the line path gets its own window extended LINE_LEAD frames of
+# run-up before the arc (~1.8 s at 25 fps), matching the de-risk span that solved.
+LINE_LEAD = 45
 
 # The 6 core + 7 secondary geometry fields produced by the physics stage.
 GEOM_FIELDS = [
@@ -60,7 +68,8 @@ _PHYS_RANGE = {
 
 
 class CricketMiner:
-    def __init__(self, device=None, ckpt_ball=_DEFAULT_BALL, ckpt_kp=_DEFAULT_KP):
+    def __init__(self, device=None, ckpt_ball=_DEFAULT_BALL, ckpt_kp=_DEFAULT_KP,
+                 ckpt_lines=_DEFAULT_LINES):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         sdb = torch.load(str(ckpt_ball), map_location=self.device)
         self.nfb = sdb.get("n_frames", 3)
@@ -70,6 +79,10 @@ class CricketMiner:
         self.K = sdk["out_ch"]
         self.mk = TrackNetV2(n_frames=1, out_ch=self.K).to(self.device).eval()
         self.mk.load_state_dict(sdk["model"])
+        # Line detector is lazy-loaded on first occluded-stump clip so a missing
+        # ckpt degrades to "no line fallback" instead of breaking construction.
+        self._ckpt_lines = ckpt_lines
+        self.ml = None
         self._ocr = None
 
     # ---- perception + physics ------------------------------------------------
@@ -96,13 +109,15 @@ class CricketMiner:
         nb = sum("ball" in o for o in obs.values())
         ns = sum("stumps" in o for o in obs.values())
         npi = sum("pitch" in o for o in obs.values())
-        # Pitch-primary (solve from pitch when stumps absent) was tried in production
-        # and FAILED: with no stumps to anchor the batter-end origin, the elongated
-        # pitch quad leaves a gauge ambiguity and the solve goes degenerate (rms>60,
-        # release flipped to x=0, V1[0]->0) -> scored 0 AND took ~38 s. So require
-        # stumps again; stump-less clips fall back to the (independent) OCR floor.
-        if nb < 4 or ns < 3:
+        if nb < 4:
             return None, dict(reason=f"insufficient det ball={nb} stumps={ns} pitch={npi}")
+        # Pitch-primary (solve from pitch alone when stumps absent) FAILED in
+        # production: the elongated pitch quad leaves a gauge ambiguity and the
+        # solve went degenerate. The LINE detector fixes that — the bowler-end
+        # return creases (visible early) break the depth gauge — so when the stumps
+        # are occluded we calibrate from lines instead of skipping to the OCR floor.
+        if ns < 3:
+            return self._geometry_lines(task, fps, kph, nb, npi)
         sol = B.fit(obs, cx, cy, fps, init_params(cx, cy, kph), kph_obs=kph)
         tg3 = time.perf_counter()
         logger.info(
@@ -117,6 +132,46 @@ class CricketMiner:
                    camC=[round(float(v), 1) for v in prm["C"]], n_ball=nb, n_stump=ns,
                    n_pitch=npi, res=f"{w0}x{h0}")
         dbg["low_confidence"] = self._low_conf(f, rms, ns)
+        return f, dbg
+
+    def _geometry_lines(self, task: Path, fps, kph, nb, npi):
+        """Occluded-stump fallback: calibrate from the detected pitch/return LINES
+        + the ball, both taken from the WIDE run-up..impact window (win_line) where
+        the line geometry is well-conditioned. Returns (fields, dbg) or (None, reason)."""
+        from scorevision.miner.private_track.cricket.physics import line_bundle as LB
+        # The wide line window is written next to the tight window by _extract_delivery;
+        # fall back to the tight window if it is absent (e.g. predict_task callers).
+        line_task = task.parent / (task.name + "_line")
+        if not (line_task.exists() and any(line_task.glob("*.jpg"))):
+            line_task = task
+        if self.ml is None:
+            try:
+                from scorevision.miner.private_track.cricket.lines.detect import LineDetector
+                self.ml = LineDetector(self._ckpt_lines, self.device)
+            except Exception as e:  # missing ckpt / load error -> no fallback
+                return None, dict(reason=f"line model unavailable: {e}", n_ball=nb)
+        tl0 = time.perf_counter()
+        lines = self.ml.detect(line_task)
+        # Re-detect the ball on the SAME wide frames so line + ball observations share
+        # one 0-based frame axis (no cross-window re-keying).
+        lframes = sorted(line_task.glob("*.jpg"))
+        img0 = cv2.imread(str(lframes[0])) if lframes else None
+        if img0 is None:
+            return None, dict(reason="no line-window frames", n_ball=nb)
+        lh0, lw0 = img0.shape[:2]
+        bcands = infer_task_topk(self.mb, line_task, self.device, self.nfb)
+        lball = PL.delivery_window(PL.clean_ball(PL.select_ball_track(bcands, lw0, lh0)))
+        ball_xy = {fr: np.array([lball[fr].x, lball[fr].y], float)
+                   for fr in lball if lball[fr].x is not None}
+        f, dbg = LB.solve_lines(lines, ball_xy, lw0 / 2.0, lh0 / 2.0, fps, kph)
+        tl1 = time.perf_counter()
+        n_line_obs = sum(len(v) for v in lines.values())
+        logger.info("[timing] geom.lines=%.2fs (frames=%d line_obs=%d ball=%d)",
+                    tl1 - tl0, len(lframes), n_line_obs, len(ball_xy))
+        if f is None:
+            dbg["n_pitch"] = npi
+            return None, dbg
+        dbg["low_confidence"] = self._low_conf(f, dbg["rms"], 0)
         return f, dbg
 
     @staticmethod
@@ -291,6 +346,11 @@ class CricketMiner:
             return sum(((xs[k] - xs[k - 1]) ** 2 + (ys[k] - ys[k - 1]) ** 2) ** 0.5
                        for k in range(1, len(af)))
 
+        # min_path is a pixel distance, so it must scale with resolution: a delivery
+        # on a 640-wide SD clip sweeps ~1/3 the pixels of a 1920-wide HD clip, and a
+        # fixed 120px floor rejected genuine SD arcs (e.g. a real arc of 109px). Scale
+        # by width, with a 40px absolute floor so a static distractor still can't pass.
+        eff_min_path = max(40.0, min_path * w0 / 1920.0)
         best, best_score = None, 0.0
         cands = []
         for run in runs:
@@ -301,19 +361,25 @@ class CricketMiner:
                 continue
             path = arc_path(af, arc)
             cands.append((af[0], af[-1], len(af), round(path)))
-            if path >= min_path and path > best_score:
+            if path >= eff_min_path and path > best_score:
                 best_score, best = path, af
         seg["candidates"] = sorted(cands, key=lambda c: -c[3])[:5]
         if best is None:
             return out, seg
         seg["chosen"] = (best[0], best[-1], round(best_score))
         lo, hi = best[0] - 2, best[-1] + 2
+        lo_line = max(0, best[0] - LINE_LEAD)  # run-up context for the line path
         win = out.parent / (out.name + "_win")
-        win.mkdir(exist_ok=True)
-        for old in win.glob("*.jpg"):
-            old.unlink()
-        # Pass 2: re-decode and write only the ~12 window frames at full res
-        # for the geometry stage (keypoints + per-window ball).
+        win_line = out.parent / (out.name + "_win_line")
+        for d in (win, win_line):
+            d.mkdir(exist_ok=True)
+            for old in d.glob("*.jpg"):
+                old.unlink()
+        # Pass 2: re-decode once and write the tight ball-arc window (win, for the
+        # ball/stump geometry) AND the wider run-up..impact window (win_line, for the
+        # occluded-stump line calibration). Filenames are the real frame index so the
+        # two windows share a frame axis; the line path re-detects the ball on win_line
+        # to keep line + ball observations on the same (wide-window) indexing.
         cap = cv2.VideoCapture(str(video_path))
         k = 0
         while k <= hi:
@@ -322,6 +388,8 @@ class CricketMiner:
                 break
             if lo <= k <= hi:
                 cv2.imwrite(str(win / f"{k:06d}.jpg"), fr)
+            if lo_line <= k <= hi:
+                cv2.imwrite(str(win_line / f"{k:06d}.jpg"), fr)
             k += 1
         cap.release()
         return win, seg

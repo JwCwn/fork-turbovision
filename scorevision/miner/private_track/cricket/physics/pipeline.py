@@ -267,20 +267,30 @@ def clean_kps(kps, thresh=12.0):
 
 
 def delivery_window(ball):
-    """Restrict ball to the delivery (release->batter): the longest run of frames
-    where image-y increases monotonically (ball descending toward the batter under
-    the bowler-end camera). Excludes isolated pre-release FPs and post-impact frames."""
+    """Restrict ball to the delivery: the longest run of frames where image-y moves
+    MONOTONICALLY (in either direction). The ball descends in image (y increasing)
+    under a behind-the-batter camera but ASCENDS (y decreasing) under a behind-the-
+    bowler camera; both are valid deliveries, so we take the longest monotonic run
+    of whichever sign dominates. Excludes isolated pre-release FPs and post-impact
+    frames. (Descending-only rejected the whole arc on bowler-end-camera clips.)"""
     fr = [f for f in sorted(ball) if ball[f].x is not None]
     if len(fr) < 4:
         return ball
     ys = [ball[f].y for f in fr]
-    best_s, best_e = 0, 0; s = 0
-    for i in range(1, len(fr)):
-        if ys[i] >= ys[i - 1] - 6:  # allow tiny non-monotonic jitter
-            if i - s > best_e - best_s:
-                best_s, best_e = s, i
-        else:
-            s = i
+
+    def longest_run(ok):
+        best_s, best_e, s = 0, 0, 0
+        for i in range(1, len(fr)):
+            if ok(ys[i], ys[i - 1]):  # within 6px jitter of the monotone trend
+                if i - s > best_e - best_s:
+                    best_s, best_e = s, i
+            else:
+                s = i
+        return best_s, best_e
+
+    ds, de = longest_run(lambda a, b: a >= b - 6)   # descending (y increasing)
+    as_, ae = longest_run(lambda a, b: a <= b + 6)   # ascending (y decreasing)
+    best_s, best_e = (as_, ae) if (ae - as_) > (de - ds) else (ds, de)
     win = set(fr[best_s:best_e + 1])
     return {f: ball[f] for f in win}
 
