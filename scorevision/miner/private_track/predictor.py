@@ -44,6 +44,8 @@ def predict_cricket_delivery(video_path: Path) -> CricketDeliveryPrediction:
     except Exception as e:
         # Never 500 the validator on hard footage; return an all-None row (score 0).
         logger.error("Cricket inference failed, returning empty prediction: %s", e)
-        pred = {}
+        pred, dbg, meta = {}, {}, {}
 
-    return CricketDeliveryPrediction(**pred)
+    # dbg/meta returned too so the caller can log the full challenge record (the
+    # miner half of the scoring feedback loop) joined with challenge_id/video_url.
+    return CricketDeliveryPrediction(**pred), dbg, meta
