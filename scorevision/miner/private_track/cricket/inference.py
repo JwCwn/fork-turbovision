@@ -136,14 +136,14 @@ class CricketMiner:
         return reasons
 
     # ---- OCR meta ------------------------------------------------------------
-    def ocr_meta(self, video_path: Path, step_secs=1.0, max_samples=45):
+    def ocr_meta(self, video_path: Path, step_secs=1.0, max_samples=16):
         """Read scoreboard metadata + the speed-gun kph from the overlay.
 
-        Unlike the geometry (first ~7 s only), the speed graphic flashes LATE
-        (~14 s) and briefly, so OCR walks the WHOLE clip at ~step_secs intervals
-        and STOPS as soon as kph is read (the persistent scoreboard metadata is
-        already captured in the first samples). `max_samples` bounds the cost on
-        long clips where no speed graphic ever appears."""
+        The speed graphic flashes ~14 s in, so OCR walks the opening ~max_samples
+        seconds and STOPS once kph is read (the persistent scoreboard metadata is
+        captured in the first samples). CPU OCR is ~1 s/frame, so max_samples is kept
+        small and the band is downscaled — a whole-clip scan cost 20 s+ (timeouts).
+        Missing a late kph only drops to the OCR floor; a timeout scores 0."""
         from scorevision.miner.private_track.cricket.scorecard_ocr import (
             extract_band, ocr_tokens, parse_meta, parse_speed,
         )
@@ -162,12 +162,19 @@ class CricketMiner:
         votes = defaultdict(Counter)
         kph = None
         fi = 0; count = 0
-        while fi < max(n, 1) and count < max_samples:
+        # Hard wall-clock budget so OCR NEVER causes a timeout regardless of the host's
+        # per-frame OCR speed (a whole-clip scan hit 20 s+ on the deployed CPU box).
+        t_ocr0 = time.perf_counter()
+        while fi < max(n, 1) and count < max_samples and time.perf_counter() - t_ocr0 < 10.0:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
             ok, fr = cap.read()
             if not ok:
                 break
-            toks = ocr_tokens(self._ocr, extract_band(fr, 0.80))
+            band = extract_band(fr, 0.80)
+            if band.shape[1] > 1000:  # downscale wide (HD) bands -> ~2x faster OCR
+                s = 1000.0 / band.shape[1]
+                band = cv2.resize(band, (1000, int(band.shape[0] * s)))
+            toks = ocr_tokens(self._ocr, band)
             if fi <= meta_cutoff:
                 for k, v in parse_meta(toks).items():
                     votes[k][v] += 1
