@@ -18,9 +18,21 @@ Parameters (24):
   W(1)             pitch half-width (m)
 """
 from __future__ import annotations
+import time
 import numpy as np
 import cv2
 from scipy.optimize import least_squares
+
+
+class _FitBudget(Exception):
+    """Raised from inside the residual to hard-stop least_squares at a wall-clock
+    deadline (scipy trf has no timeout/callback of its own)."""
+
+
+class _Sol:
+    """Minimal least_squares-result stand-in (only .x is consumed downstream)."""
+    __slots__ = ("x", "success", "nfev", "cost")
+
 
 G = 9.81
 STUMP_H = 0.711
@@ -134,16 +146,33 @@ def residuals(p, obs, cx, cy, fps, w=(1.0, 1.0, 2.0, 0.05), kph_obs=None):
     return np.array(res)
 
 
-def fit(obs, cx, cy, fps, init, kph_obs=None):
+def fit(obs, cx, cy, fps, init, kph_obs=None, budget_s=6.0):
     p0 = np.clip(np.array(init, float), LB + 1e-6, UB - 1e-6)
-    # max_nfev 8000 -> 2000 -> 1000: a GOOD solve converges in a few hundred evals
-    # (clean clips fit in ~3 s). Only a DEGENERATE solve keeps iterating to the cap,
-    # and its result is discarded by the physical-range guard anyway -- so the extra
-    # evals just burned wall-clock (a 60-frame window still hit ~18 s at 2000). Cap it
-    # low; the caller also subsamples the observation frames.
-    return least_squares(residuals, p0, args=(obs, cx, cy, fps),
-                         kwargs={"kph_obs": kph_obs}, method="trf",
-                         bounds=(LB, UB), loss="soft_l1", f_scale=2.0, max_nfev=1000)
+    # HARD wall-clock cap. A GOOD solve converges in a few hundred evals (~3 s); only
+    # a DEGENERATE solve keeps iterating, and its result is nulled by the physical-
+    # range guard anyway. max_nfev alone did NOT bound the time (per-eval cost scales
+    # with the keypoint count, so a stumps+pitch 1080p clip still hit ~13-18 s). So we
+    # also enforce a wall-clock deadline from inside the residual and return the best
+    # iterate seen so far -> geom.fit can never exceed budget_s regardless of clip.
+    t0 = time.perf_counter()
+    best = {"x": p0, "c": np.inf}
+
+    def _resid(p, *a, **k):
+        res = residuals(p, *a, **k)
+        c = float(np.dot(res, res))
+        if c < best["c"]:
+            best["c"], best["x"] = c, p.copy()
+        if time.perf_counter() - t0 > budget_s:
+            raise _FitBudget()
+        return res
+
+    try:
+        return least_squares(_resid, p0, args=(obs, cx, cy, fps),
+                             kwargs={"kph_obs": kph_obs}, method="trf",
+                             bounds=(LB, UB), loss="soft_l1", f_scale=2.0, max_nfev=1000)
+    except _FitBudget:
+        s = _Sol(); s.x = best["x"]; s.success = False; s.nfev = -1; s.cost = best["c"]
+        return s
 
 
 IMPACT_X = 1.22  # popping crease (m from stumps): default batter interception plane
