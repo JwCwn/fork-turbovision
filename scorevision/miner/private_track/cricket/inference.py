@@ -163,6 +163,14 @@ class CricketMiner:
         lball = PL.delivery_window(PL.clean_ball(PL.select_ball_track(bcands, lw0, lh0)))
         ball_xy = {fr: np.array([lball[fr].x, lball[fr].y], float)
                    for fr in lball if lball[fr].x is not None}
+        # Bound the solve: least_squares cost scales with (line observations) x nfev,
+        # and the full ~90-frame window blew up to 700 s+ in production. The LINE
+        # endpoints dominate the residual (~6 lines/frame), so cap them to ~16
+        # evenly-spaced frames (keeps temporal spread + bowler-end coverage); the ball
+        # arc is small and carries the trajectory, so keep it whole. solve_lines also
+        # caps nfev.
+        keep = self._even_frames(sorted(lines), 16)
+        lines = {k: v for k, v in lines.items() if k in keep}
         f, dbg = LB.solve_lines(lines, ball_xy, lw0 / 2.0, lh0 / 2.0, fps, kph)
         tl1 = time.perf_counter()
         n_line_obs = sum(len(v) for v in lines.values())
@@ -173,6 +181,14 @@ class CricketMiner:
             return None, dbg
         dbg["low_confidence"] = self._low_conf(f, dbg["rms"], 0)
         return f, dbg
+
+    @staticmethod
+    def _even_frames(keys, cap):
+        """Pick <=cap evenly-spaced items from a sorted key list (keeps the temporal
+        spread; endpoints included)."""
+        if len(keys) <= cap:
+            return set(keys)
+        return {keys[round(i * (len(keys) - 1) / (cap - 1))] for i in range(cap)}
 
     @staticmethod
     def _low_conf(f, rms, ns):

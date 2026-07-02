@@ -62,7 +62,7 @@ def line_residuals(p, lines, ball, cx, cy, fps, fr0, kph, wL=1.0, wB=2.0, wr=0.0
     return np.array(res)
 
 
-def solve_lines(lines, ball, cx, cy, fps, kph, max_nfev=2000):
+def solve_lines(lines, ball, cx, cy, fps, kph, max_nfev=200):
     """lines: {frame:{name:(a,b)}} in px; ball: {frame: np.array([x,y])} in px.
 
     Returns (fields, dbg) on a well-posed solve, else (None, dbg-with-reason).
