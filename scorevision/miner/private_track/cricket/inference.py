@@ -36,6 +36,7 @@ _PKG_DIR = Path(__file__).resolve().parent
 _DEFAULT_BALL = _PKG_DIR / "tracknet" / "ckpt_wb.pt"
 _DEFAULT_KP = _PKG_DIR / "keypoints" / "ckpt_kp.pt"
 _DEFAULT_LINES = _PKG_DIR / "lines" / "ckpt_lines.pt"
+_DEFAULT_REG = _PKG_DIR / "regressor" / "reg_width_pr.pt"
 _SCRATCH = Path(tempfile.gettempdir()) / "cricket_miner"
 # The live delivery (release -> batter) sits in the opening seconds of every
 # challenge clip; the rest is replays / other cameras. Geometry only searches
@@ -76,7 +77,7 @@ _PHYS_RANGE = {
 
 class CricketMiner:
     def __init__(self, device=None, ckpt_ball=_DEFAULT_BALL, ckpt_kp=_DEFAULT_KP,
-                 ckpt_lines=_DEFAULT_LINES):
+                 ckpt_lines=_DEFAULT_LINES, ckpt_reg=_DEFAULT_REG):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         sdb = torch.load(str(ckpt_ball), map_location=self.device)
         self.nfb = sdb.get("n_frames", 3)
@@ -90,6 +91,11 @@ class CricketMiner:
         # ckpt degrades to "no line fallback" instead of breaking construction.
         self._ckpt_lines = ckpt_lines
         self.ml = None
+        # Camera-invariant width regressor (sim-trained): robust stump_y where the
+        # bundle degenerates. Lazy-loaded; a missing ckpt just leaves stump_y to the
+        # bundle. See regressor/model.py.
+        self._ckpt_reg = ckpt_reg
+        self.mr = None
         self._ocr = None
 
     # ---- perception + physics ------------------------------------------------
@@ -160,23 +166,12 @@ class CricketMiner:
         line_task = task.parent / (task.name + "_line")
         if not (line_task.exists() and any(line_task.glob("*.jpg"))):
             line_task = task
-        if self.ml is None:
-            try:
-                from scorevision.miner.private_track.cricket.lines.detect import LineDetector
-                self.ml = LineDetector(self._ckpt_lines, self.device)
-            except Exception as e:  # missing ckpt / load error -> no fallback
-                return None, dict(reason=f"line model unavailable: {e}", n_ball=nb)
         tl0 = time.perf_counter()
-        lines = self.ml.detect(line_task)
-        # Re-detect the ball on the SAME wide frames so line + ball observations share
-        # one 0-based frame axis (no cross-window re-keying).
-        lframes = sorted(line_task.glob("*.jpg"))
-        img0 = cv2.imread(str(lframes[0])) if lframes else None
-        if img0 is None:
-            return None, dict(reason="no line-window frames", n_ball=nb)
-        lh0, lw0 = img0.shape[:2]
-        bcands = infer_task_topk(self.mb, line_task, self.device, self.nfb)
-        lball = PL.delivery_window(PL.clean_ball(PL.select_ball_track(bcands, lw0, lh0)))
+        lf = self._line_features(line_task)   # shared detect (also used by the regressor)
+        if lf is None:
+            return None, dict(reason="line features unavailable", n_ball=nb)
+        lines, lball, lw0, lh0 = lf["lines"], lf["ballw"], lf["w0"], lf["h0"]
+        lframes = range(lf["n_frames"])
         ball_xy = {fr: np.array([lball[fr].x, lball[fr].y], float)
                    for fr in lball if lball[fr].x is not None}
         # Bound the solve: least_squares cost scales with (line observations) x nfev,
@@ -197,6 +192,74 @@ class CricketMiner:
             return None, dbg
         dbg["low_confidence"] = self._low_conf(f, dbg["rms"], 0)
         return f, dbg
+
+    def _line_features(self, line_task: Path):
+        """Detect pitch/crease LINES + the BALL on the wide line window ONCE, cached by
+        path within a predict. Shared by the line-calibration fallback and the width
+        regressor so the line detector + ball topk run a single time per window.
+        Returns {lines, ballw, w0, h0, n_frames} or None."""
+        key = str(line_task)
+        if getattr(self, "_lf_key", None) == key:
+            return self._lf_val
+        val = None
+        frames = sorted(line_task.glob("*.jpg"))
+        img0 = cv2.imread(str(frames[0])) if frames else None
+        if img0 is not None:
+            if self.ml is None:
+                try:
+                    from scorevision.miner.private_track.cricket.lines.detect import LineDetector
+                    self.ml = LineDetector(self._ckpt_lines, self.device)
+                except Exception as e:
+                    logger.info("line detector unavailable: %s", e)
+                    self._lf_key, self._lf_val = key, None
+                    return None
+            h0, w0 = img0.shape[:2]
+            lines = self.ml.detect(line_task)
+            bcands = infer_task_topk(self.mb, line_task, self.device, self.nfb)
+            ballw = PL.delivery_window(PL.clean_ball(PL.select_ball_track(bcands, w0, h0)))
+            val = dict(lines=lines, ballw=ballw, w0=w0, h0=h0, n_frames=len(frames))
+        self._lf_key, self._lf_val = key, val
+        return val
+
+    def _regress_width(self, task: Path):
+        """Camera-invariant stump_y (sim-trained regressor). Line-detector pitch edges
+        -> 4 corners, ckpt_wb ball, PITCH-relative feature -> stump_y. Robust where the
+        bundle degenerates; returns {stump_y,...} or None if edges/ball insufficient."""
+        from collections import defaultdict
+        if self.mr is None:
+            try:
+                from scorevision.miner.private_track.cricket.regressor.model import WidthRegressor
+                self.mr = WidthRegressor(self._ckpt_reg, self.device)
+            except Exception as e:
+                logger.info("width regressor unavailable: %s", e)
+                return None
+        line_task = task.parent / (task.name + "_line")   # wide window = both pitch ends
+        if not (line_task.exists() and any(line_task.glob("*.jpg"))):
+            line_task = task
+        lf = self._line_features(line_task)
+        if lf is None:
+            return None
+        acc = defaultdict(lambda: ([], []))
+        for d in lf["lines"].values():
+            for name in ("pitch_left_edge", "pitch_right_edge"):
+                if name in d:
+                    a, b = d[name]; acc[name][0].append(a); acc[name][1].append(b)
+
+        def med(pts):
+            return tuple(np.median(np.array(pts), 0)) if pts else None
+
+        corners = {}
+        if "pitch_left_edge" in acc:
+            corners["pitch_left_far"] = med(acc["pitch_left_edge"][0])
+            corners["pitch_left_near"] = med(acc["pitch_left_edge"][1])
+        if "pitch_right_edge" in acc:
+            corners["pitch_right_far"] = med(acc["pitch_right_edge"][0])
+            corners["pitch_right_near"] = med(acc["pitch_right_edge"][1])
+        ballw = lf["ballw"]
+        ball = {f: (ballw[f].x, ballw[f].y) for f in ballw if ballw[f].x is not None}
+        if len(ball) < 5:
+            return None
+        return self.mr.predict(ball, corners)
 
     @staticmethod
     def _even_frames(keys, cap):
@@ -314,6 +377,7 @@ class CricketMiner:
     # ---- full prediction from a raw video -----------------------------------
     def predict_video(self, video_path, fps=25.0):
         video_path = Path(video_path)
+        self._lf_key = None                 # reset the per-video shared line/ball cache
         t0 = time.perf_counter()
         # OCR is independent of the perception/physics path, so run it on a
         # worker thread: its ~7s overlaps the extract pass instead of adding to
@@ -331,13 +395,32 @@ class CricketMiner:
             "[timing] extract=%.2fs ocr_wait=%.2fs geometry=%.2fs total=%.2fs",
             t_extract - t0, t_ocr - t_extract, t_geom - t_ocr, t_geom - t0,
         )
+        # Camera-invariant stump_y (sim-trained regressor): robust where the bundle's
+        # stump_y degenerates to a nulled 0. Override the emitted stump_y when the
+        # regressor produced an in-range value; the bundle keeps the other fields. This
+        # is the field being A/B'd against the bundle via the real validator score.
+        reg = None
+        try:
+            reg = self._regress_width(task)
+        except Exception as e:
+            logger.info("width regress failed: %s", e)
+        t_reg = time.perf_counter()
+        logger.info(
+            "[timing] extract=%.2fs ocr_wait=%.2fs geometry=%.2fs regress=%.2fs total=%.2fs",
+            t_extract - t0, t_ocr - t_extract, t_geom - t_ocr, t_reg - t_geom, t_reg - t0,
+        )
         dbg["seg"] = seg
         dbg["timing"] = {
             "extract": round(t_extract - t0, 2),
             "ocr_wait": round(t_ocr - t_extract, 2),
             "geometry": round(t_geom - t_ocr, 2),
+            "regress": round(t_reg - t_geom, 2),
         }
-        return self._assemble(meta, geom), dbg, meta
+        pred = self._assemble(meta, geom)
+        if reg is not None and reg.get("stump_y") is not None and abs(reg["stump_y"]) < 3.0:
+            dbg["reg_stump_y"] = round(reg["stump_y"], 3)
+            pred["stump_y"] = round(float(reg["stump_y"]), 4)
+        return pred, dbg, meta
 
     def predict_task(self, task, kph=None, meta=None):
         geom, dbg = self.geometry(Path(task), kph)
