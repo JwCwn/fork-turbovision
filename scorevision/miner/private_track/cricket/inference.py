@@ -61,6 +61,11 @@ GEOM_FIELDS = [
 # Physical envelopes (metres / degrees) used to reject degenerate solves: a value
 # outside its range is reconstruction garbage, not a real estimate, so it is nulled.
 _PHYS_RANGE = {
+    # kph: the physics-solve speed echo is only a rough trajectory estimate and goes
+    # wild on a degenerate solve (e.g. 199 km/h, physically impossible). Guard it to
+    # the plausible delivery band (same as the OCR speed parser) so a garbage solve
+    # emits None instead of an absurd speed. A real OCR reading overrides this anyway.
+    "kph": (40.0, 170.0),
     "bounce_x": (-2.0, 25.0), "stump_y": (-3.0, 3.0), "stump_z": (-1.0, 4.0),
     "swing_angle": (-25.0, 25.0), "deviation": (-25.0, 25.0),
     "release_y": (-3.0, 3.0), "release_z": (0.0, 4.0), "bounce_y": (-3.0, 3.0),
@@ -257,7 +262,12 @@ class CricketMiner:
         cap = cv2.VideoCapture(str(video_path))
         n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps_v = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        step = max(1, int(step_secs * fps_v))
+        # Spread the samples across the WHOLE clip. The speed-gun graphic appears LATE
+        # (~10-15 s, AFTER the delivery), so a fixed 1 s step from t=0 exhausted the 10 s
+        # wall-clock budget at ~t=10 s — just before the speed showed (missed 119 km/h).
+        # Spacing the same sample count over the full duration reaches the late speed
+        # within budget, while the persistent scoreboard metadata is still covered early.
+        step = max(1, n // max_samples) if n else max(1, int(step_secs * fps_v))
         # Metadata is voted (most-common) over the DELIVERY window only — runs/overs
         # advance later in the clip, so a whole-clip vote would drift off the ball we
         # are scored on. kph is taken from its first plausible reading anywhere.
