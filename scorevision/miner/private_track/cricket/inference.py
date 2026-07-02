@@ -26,6 +26,8 @@ from scorevision.miner.private_track.cricket.tracknet.model import TrackNetV2
 from scorevision.miner.private_track.cricket.tracknet.infer import (
     frame_to_cache, infer_task_topk, infer_cache_topk,
 )
+from scorevision.miner.private_track.cricket.tracknet.heatmap import heatmap_peak
+from scorevision.miner.private_track.cricket.keypoints.dataset import KP_NAMES
 from scorevision.miner.private_track.cricket.physics import bundle as B
 from scorevision.miner.private_track.cricket.physics.run_delivery import init_params
 from scorevision.miner.private_track.cricket.physics import pipeline as PL
@@ -189,6 +191,36 @@ class CricketMiner:
         if len(keys) <= cap:
             return set(keys)
         return {keys[round(i * (len(keys) - 1) / (cap - 1))] for i in range(cap)}
+
+    def _fpv_run(self, cache, min_pitch=2, min_len=12):
+        """Ball-independent delivery localization (front-pitch-view cue). The live
+        delivery is shot from the batter-end camera with the pitch in view, so the
+        pitch corners fire over a contiguous run of frames; replays / boundary cams
+        do not. Returns the (s, e) frame range (indices into cache) of the longest
+        such run, or None. Used to reject distractor ball arcs — a static bright blob
+        elsewhere in the clip that the ball detector latches onto — that fall outside
+        the actual delivery shot."""
+        pitch_idx = [i for i, n in enumerate(KP_NAMES) if n.startswith("pitch")]
+        counts = []
+        with torch.no_grad():
+            for st in range(0, len(cache), 32):
+                xb = np.stack(cache[st:st + 32])
+                hm = self.mk(torch.from_numpy(xb).to(self.device)).cpu().numpy()
+                for b in range(hm.shape[0]):
+                    counts.append(sum(1 for k in pitch_idx
+                                      if heatmap_peak(hm[b, k], thresh=0.25)))
+        best, i = (0, -1), 0
+        while i < len(counts):
+            if counts[i] >= min_pitch:
+                j = i
+                while j < len(counts) and counts[j] >= min_pitch:
+                    j += 1
+                if j - 1 - i > best[1] - best[0]:
+                    best = (i, j - 1)
+                i = j
+            else:
+                i += 1
+        return best if best[1] - best[0] + 1 >= min_len else None
 
     @staticmethod
     def _low_conf(f, rms, ns):
@@ -367,6 +399,16 @@ class CricketMiner:
         # fixed 120px floor rejected genuine SD arcs (e.g. a real arc of 109px). Scale
         # by width, with a 40px absolute floor so a static distractor still can't pass.
         eff_min_path = max(40.0, min_path * w0 / 1920.0)
+        # Front-pitch-view run (pitch visible) = the delivery shot. The delivery
+        # RELEASE happens while the pitch is in view, so a real arc STARTS inside the
+        # FPV run; the ball then travels past it (arc extends beyond). A distractor
+        # elsewhere in the clip (e.g. a static bright blob after the shot) starts
+        # OUTSIDE the run. Gate on the arc's start (ball-independent), which rejects
+        # distractors the arc-path score alone can't — without clipping the real
+        # arc's post-impact tail.
+        fpv = self._fpv_run(cache)
+        if fpv is not None:
+            seg["fpv"] = fpv
         best, best_score = None, 0.0
         cands = []
         for run in runs:
@@ -376,8 +418,9 @@ class CricketMiner:
             if len(af) < min_arc:
                 continue
             path = arc_path(af, arc)
-            cands.append((af[0], af[-1], len(af), round(path)))
-            if path >= eff_min_path and path > best_score:
+            outside = fpv is not None and not (fpv[0] - 5 <= af[0] <= fpv[1] + 5)
+            cands.append((af[0], af[-1], len(af), round(path), "out" if outside else "in"))
+            if not outside and path >= eff_min_path and path > best_score:
                 best_score, best = path, af
         seg["candidates"] = sorted(cands, key=lambda c: -c[3])[:5]
         if best is None:
