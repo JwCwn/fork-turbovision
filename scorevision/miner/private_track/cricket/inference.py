@@ -125,6 +125,15 @@ class CricketMiner:
         # are occluded we calibrate from lines instead of skipping to the OCR floor.
         if ns < 3:
             return self._geometry_lines(task, fps, kph, nb, npi)
+        # Cap the observation frames before the fit. detect_keypoints_robust broadcasts
+        # the SAME stumps/pitch to every window frame (redundant across frames) and ~30
+        # ball points fully describe the arc, so a long (60+ frame) window only inflates
+        # the least_squares residual -> the fit ran to 18 s. Subsample to keep the
+        # temporal spread (arc + stump anchor) at a fraction of the cost; a clean solve
+        # still converges, a degenerate one is capped by max_nfev regardless.
+        if len(obs) > 32:
+            keep = self._even_frames(sorted(obs), 32)
+            obs = {k: v for k, v in obs.items() if k in keep}
         sol = B.fit(obs, cx, cy, fps, init_params(cx, cy, kph), kph_obs=kph)
         tg3 = time.perf_counter()
         logger.info(
