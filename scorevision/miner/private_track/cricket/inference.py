@@ -96,6 +96,7 @@ class CricketMiner:
         # bundle. See regressor/model.py.
         self._ckpt_reg = ckpt_reg
         self.mr = None
+        self._geom_ball = None    # ball {frame:(u,v)} from geometry, reused by the regressor
         self._ocr = None
 
     # ---- perception + physics ------------------------------------------------
@@ -117,6 +118,9 @@ class CricketMiner:
         kpc = PL.clean_kps(kps)
         if not ballw:
             return None, dict(reason="no ball window")
+        # Cache the ball (image px) so the width regressor can reuse it instead of
+        # re-detecting the ball on the wide window (the costly 1080p JPG re-read).
+        self._geom_ball = {f: (ballw[f].x, ballw[f].y) for f in ballw if ballw[f].x is not None}
         fr0 = min(ballw)
         obs = {f - fr0: o for f, o in PL.build_obs(ballw, kpc).items()}
         nb = sum("ball" in o for o in obs.values())
@@ -236,11 +240,27 @@ class CricketMiner:
         line_task = task.parent / (task.name + "_line")   # wide window = both pitch ends
         if not (line_task.exists() and any(line_task.glob("*.jpg"))):
             line_task = task
-        lf = self._line_features(line_task)
-        if lf is None:
-            return None
+        # Occluded clips already ran the shared line+ball detection (line path) -> reuse
+        # it. Stump clips have NOT, so run just the LINE detector (cheap) for the corners
+        # and reuse the ball geometry already found -> avoids the costly ball re-read on
+        # the wide 1080p window (that was ~5 s of the regress cost).
+        if getattr(self, "_lf_key", None) == str(line_task) and self._lf_val is not None:
+            lines = self._lf_val["lines"]
+            bw = self._lf_val["ballw"]
+            ball = {f: (bw[f].x, bw[f].y) for f in bw if bw[f].x is not None}
+        else:
+            if self.ml is None:
+                try:
+                    from scorevision.miner.private_track.cricket.lines.detect import LineDetector
+                    self.ml = LineDetector(self._ckpt_lines, self.device)
+                except Exception:
+                    return None
+            if not any(line_task.glob("*.jpg")):
+                return None
+            lines = self.ml.detect(line_task, max_frames=20)   # corners only -> few frames
+            ball = self._geom_ball or {}
         acc = defaultdict(lambda: ([], []))
-        for d in lf["lines"].values():
+        for d in lines.values():
             for name in ("pitch_left_edge", "pitch_right_edge"):
                 if name in d:
                     a, b = d[name]; acc[name][0].append(a); acc[name][1].append(b)
@@ -255,8 +275,6 @@ class CricketMiner:
         if "pitch_right_edge" in acc:
             corners["pitch_right_far"] = med(acc["pitch_right_edge"][0])
             corners["pitch_right_near"] = med(acc["pitch_right_edge"][1])
-        ballw = lf["ballw"]
-        ball = {f: (ballw[f].x, ballw[f].y) for f in ballw if ballw[f].x is not None}
         if len(ball) < 5:
             return None
         return self.mr.predict(ball, corners)
@@ -378,6 +396,7 @@ class CricketMiner:
     def predict_video(self, video_path, fps=25.0):
         video_path = Path(video_path)
         self._lf_key = None                 # reset the per-video shared line/ball cache
+        self._geom_ball = None
         t0 = time.perf_counter()
         # OCR is independent of the perception/physics path, so run it on a
         # worker thread: its ~7s overlaps the extract pass instead of adding to

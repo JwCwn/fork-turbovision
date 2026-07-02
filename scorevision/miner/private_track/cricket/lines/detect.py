@@ -56,15 +56,20 @@ class LineDetector:
         self.m.load_state_dict(sd["model"])
         self.device = device
 
-    def detect(self, task, thresh=0.4):
+    def detect(self, task, thresh=0.4, max_frames=0):
         """Folder of *.jpg -> {frame_idx: {line_name: (p0, p1)}} in original px.
 
         frame_idx is the 0-based position in sorted(task.glob('*.jpg')) — the SAME
         indexing the ball detector uses — so line and ball observations share a
-        frame axis without any re-keying."""
+        frame axis without any re-keying. max_frames>0 evenly subsamples the frames
+        (the pitch lines are static, so a handful suffice for the corner medians and
+        it avoids reading every HD frame)."""
         frames = sorted(Path(task).glob("*.jpg"))
         if not frames:
             return {}
+        if max_frames and len(frames) > max_frames:
+            idx = [round(k * (len(frames) - 1) / (max_frames - 1)) for k in range(max_frames)]
+            frames = [frames[k] for k in sorted(set(idx))]
         h0, w0 = cv2.imread(str(frames[0])).shape[:2]
         sx, sy = w0 / 512.0, h0 / 288.0
         lines: dict[int, dict] = defaultdict(dict)
