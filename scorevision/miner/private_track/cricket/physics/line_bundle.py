@@ -10,6 +10,7 @@ solve therefore needs a ball arc AND at least one bowler-end return observation.
 """
 from __future__ import annotations
 
+import time
 import numpy as np
 from scipy.optimize import least_squares
 
@@ -62,7 +63,7 @@ def line_residuals(p, lines, ball, cx, cy, fps, fr0, kph, wL=1.0, wB=2.0, wr=0.0
     return np.array(res)
 
 
-def solve_lines(lines, ball, cx, cy, fps, kph, max_nfev=200):
+def solve_lines(lines, ball, cx, cy, fps, kph, max_nfev=200, budget_s=6.0):
     """lines: {frame:{name:(a,b)}} in px; ball: {frame: np.array([x,y])} in px.
 
     Returns (fields, dbg) on a well-posed solve, else (None, dbg-with-reason).
@@ -83,11 +84,30 @@ def solve_lines(lines, ball, cx, cy, fps, kph, max_nfev=200):
                                  f"bowler_frames={frames_with_bowler}")
     fr0 = min(ball)
     p0 = np.clip(np.array(init_params(cx, cy, kph), float), B.LB + 1e-6, B.UB - 1e-6)
-    sol = least_squares(
-        line_residuals, p0, args=(lines, ball, cx, cy, fps, fr0, kph),
-        method="trf", bounds=(B.LB, B.UB), loss="soft_l1", f_scale=2.0,
-        max_nfev=max_nfev,
-    )
+    # HARD wall-clock deadline (same as bundle.fit): max_nfev alone did NOT bound the
+    # time -- the Python line residual is expensive, so 76 line-obs x 200 nfev still
+    # ran ~18 s and timed the challenge out. Stop at budget_s and keep the best iterate
+    # (a degenerate line solve is nulled by the physical-range guard anyway).
+    t0 = time.perf_counter()
+    best = {"x": p0, "c": np.inf}
+
+    def _resid(p, *a, **k):
+        res = line_residuals(p, *a, **k)
+        c = float(np.dot(res, res))
+        if c < best["c"]:
+            best["c"], best["x"] = c, p.copy()
+        if time.perf_counter() - t0 > budget_s:
+            raise B._FitBudget()
+        return res
+
+    try:
+        sol = least_squares(
+            _resid, p0, args=(lines, ball, cx, cy, fps, fr0, kph),
+            method="trf", bounds=(B.LB, B.UB), loss="soft_l1", f_scale=2.0,
+            max_nfev=max_nfev,
+        )
+    except B._FitBudget:
+        sol = B._Sol(); sol.x = best["x"]; sol.success = False; sol.nfev = -1; sol.cost = best["c"]
     prm = B.unpack(sol.x)
     r = line_residuals(sol.x, lines, ball, cx, cy, fps, fr0, kph)
     rms = float(np.sqrt(np.mean(r ** 2)))

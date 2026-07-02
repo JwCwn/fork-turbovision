@@ -128,13 +128,15 @@ class CricketMiner:
         npi = sum("pitch" in o for o in obs.values())
         if nb < 4:
             return None, dict(reason=f"insufficient det ball={nb} stumps={ns} pitch={npi}")
-        # Pitch-primary (solve from pitch alone when stumps absent) FAILED in
-        # production: the elongated pitch quad leaves a gauge ambiguity and the
-        # solve went degenerate. The LINE detector fixes that — the bowler-end
-        # return creases (visible early) break the depth gauge — so when the stumps
-        # are occluded we calibrate from lines instead of skipping to the OCR floor.
+        # Occluded stumps: the line-bundle calibration was tried in production and was
+        # BOTH a timeout source (the Python line residual ran ~18-25 s) AND always
+        # degenerate (it scored 0 on every occluded clip). The camera-invariant width
+        # regressor now supplies a robust stump_y for these clips (run in predict_video)
+        # and OCR supplies the meta, so we skip the line solve entirely rather than burn
+        # wall-clock on a garbage bundle. (_geometry_lines is kept for reference/offline.)
         if ns < 3:
-            return self._geometry_lines(task, fps, kph, nb, npi)
+            return None, dict(reason=f"occluded stumps={ns}; regressor+OCR only",
+                              n_ball=nb, n_pitch=npi, calib="regressor")
         # Cap the observation frames before the fit. detect_keypoints_robust broadcasts
         # the SAME stumps/pitch to every window frame (redundant across frames) and ~30
         # ball points fully describe the arc, so a long (60+ frame) window only inflates
